@@ -1,206 +1,262 @@
-// Pines de los Relevadores (Notas físicas del piano: Do, Re, Mi, Fa, Sol, La, Si)
-const int RELE_DO  = 8;
-const int RELE_RE  = 7;
-const int RELE_MI  = 6;
-const int RELE_FA  = 5;
-const int RELE_SOL = 4;
-const int RELE_LA  = 3; // Se mantienen para las melodías
-const int RELE_SI  = 2; // Se mantienen para las melodías
+/* ============================================================
+   TALAT - PIANO DE RELEVADORES
+   Arduino UNO + 8 relevadores
 
-// Estructura para definir las notas de la melodía
-struct NotaMusical {
-  int pinRele;       
-  int duracionMs;    
+     D8 -> rele 0 DO     D3 -> rele 5 FA#
+     D7 -> rele 1 RE     D2 -> rele 6 LA
+     D6 -> rele 2 MI     D9 -> rele 7 SI
+     D5 -> rele 3 FA
+     D4 -> rele 4 SOL
+
+   Si no has cableado los tres nuevos, ponles SIN_CONECTAR.
+   Velocidad 115200. El modulo de relevadores con su propia
+   fuente de 5V y los GND unidos.
+
+   PROTOCOLO:  T:0,2,4:600   pisa reles 0,2,4 por 600 ms
+               X             suelta todos
+   ============================================================ */
+
+const byte NUM_TECLAS = 8;
+
+// Para los relevadores que todavia no estan cableados.
+const byte SIN_CONECTAR = 255;
+
+// 0=DO  1=RE  2=MI  3=FA  4=SOL  5=LA  6=FA#  7=SI
+const byte PINES[NUM_TECLAS] = {
+  8, 7, 6, 5, 4,
+  3, 2, 9
 };
 
-// Control de Modos (True = Melodías/Acordes, False = Notas individuales)
-bool modoMelodia = true; 
+// Si al encender suenan TODAS las teclas, cambia esto a false.
+const bool ACTIVA_EN_BAJO = true;
 
-// ==========================================
-// DEFINICIÓN DE MELODÍAS (Máximo 15 notas)
-// ==========================================
-const int NOTAS_ALEGRIA = 9;
-NotaMusical mel_alegria[NOTAS_ALEGRIA] = {
-  {RELE_DO, 200}, {RELE_MI, 200}, {RELE_SOL, 200}, {RELE_DO, 400},
-  {RELE_SOL, 200}, {RELE_DO, 200}, {RELE_MI, 200}, {RELE_SOL, 200}, {RELE_DO, 600}
-};
+// Cuanto se levanta el dedo entre dos golpes de la MISMA nota.
+// Sin esto, "RE RE RE" se oye como un solo RE largo.
+const unsigned long SEPARACION_REPIQUE_MS = 35;
 
-const int NOTAS_TRISTEZA = 6;
-NotaMusical mel_tristeza[NOTAS_TRISTEZA] = {
-  {RELE_SOL, 500}, {RELE_FA, 500}, {RELE_MI, 500}, {RELE_RE, 500}, {RELE_DO, 800}, {0, 400} 
-};
+// Soltar las notas que ya no se piden cuando llega una nota nueva.
+const bool CORTAR_ANTERIOR = true;
 
-const int NOTAS_SORPRESA = 5;
-NotaMusical mel_sorpresa[NOTAS_SORPRESA] = {
-  {RELE_DO, 150}, {RELE_SOL, 150}, {RELE_DO, 150}, {RELE_SOL, 150}, {RELE_DO, 500}
-};
+// Lo minimo que una tecla debe quedarse pisada para que suene.
+const unsigned long MINIMO_PISADO_MS = 70;
 
-const int NOTAS_IRA = 8;
-NotaMusical mel_ira[NOTAS_IRA] = {
-  {RELE_RE, 150}, {RELE_RE, 150}, {RELE_RE, 300}, {RELE_RE, 150}, {RELE_RE, 150}, {RELE_RE, 300}, {RELE_FA, 300}, {RELE_RE, 500}
-};
+// Tope de seguridad.
+const unsigned long MAXIMO_MS = 2000;
 
-const int NOTAS_ABURRIMIENTO = 4;
-NotaMusical mel_aburrimiento[NOTAS_ABURRIMIENTO] = {
-  {RELE_MI, 600}, {0, 300}, {RELE_RE, 600}, {RELE_DO, 1000}
-};
+bool pisada[NUM_TECLAS];
+unsigned long pisada_desde[NUM_TECLAS];
+unsigned long soltar_en[NUM_TECLAS];
+unsigned long repisar_en[NUM_TECLAS];
 
-// Variables de control de flujo de la música (Modo Melodía)
-String mensajeRecibido = "";
-NotaMusical* melodiaActual = NULL;
-int totalNotasActual = 0;
-int notaIndex = -1;
-unsigned long tiempoNotaAnterior = 0;
-bool notaEnProgreso = false;
+String entrada = "";
 
-// Variables de control (Modo Nota Individual)
-unsigned long tiempoActivacionNota = 0;
-const long DURACION_NOTA = 500;  
-int pinNotaActivo = -1;         
+// Declaraciones adelantadas.
+void pisarTecla(byte tecla, unsigned long ahora);
+void soltarTecla(byte tecla);
+void soltarTodo();
+void leerSerial();
+void atenderTiempos();
+void procesar(String linea);
 
 void setup() {
-  Serial.begin(9600);
-  
-  pinMode(RELE_DO, OUTPUT);
-  pinMode(RELE_RE, OUTPUT);
-  pinMode(RELE_MI, OUTPUT);
-  pinMode(RELE_FA, OUTPUT);
-  pinMode(RELE_SOL, OUTPUT);
-  pinMode(RELE_LA, OUTPUT);
-  pinMode(RELE_SI, OUTPUT);
-  
-  apagarTodosLosRelevadores();
+  for (byte i = 0; i < NUM_TECLAS; i++) {
+    pisada[i] = false;
+    pisada_desde[i] = 0;
+    soltar_en[i] = 0;
+    repisar_en[i] = 0;
+
+    if (PINES[i] == SIN_CONECTAR) {
+      continue;
+    }
+
+    pinMode(PINES[i], OUTPUT);
+    soltarTecla(i);
+  }
+
+  Serial.begin(115200);
+  entrada.reserve(48);
+
+  Serial.println("TALAT listo");
 }
 
 void loop() {
-  // 1. LEER EL PUERTO SERIAL
+  leerSerial();
+  atenderTiempos();
+}
+
+/* ---------- comunicacion ---------- */
+
+void leerSerial() {
   while (Serial.available() > 0) {
-    char caracter = Serial.read();
-    if (caracter == '\n') {
-      mensajeRecibido.trim();
-      
-      // Cambio de modos dinámico enviado desde Python
-      if (mensajeRecibido == "MODO_MELODIA") {
-        modoMelodia = true;
-        resetearEstados();
-      } 
-      else if (mensajeRecibido == "MODO_NOTA") {
-        modoMelodia = false;
-        resetearEstados();
-      } 
-      else {
-        // Ejecutar la acción dependiendo del modo activo
-        if (modoMelodia) {
-          procesarModoMelodia(mensajeRecibido);
-        } else {
-          procesarModoNota(mensajeRecibido);
-        }
+    char c = (char)Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (entrada.length() > 0) {
+        procesar(entrada);
+        entrada = "";
       }
-      mensajeRecibido = "";
+    } else if (entrada.length() < 44) {
+      entrada += c;
+    }
+  }
+}
+
+void procesar(String linea) {
+  linea.trim();
+
+  if (linea.length() == 0) {
+    return;
+  }
+
+  if (linea.charAt(0) == 'X' || linea.charAt(0) == 'x') {
+    soltarTodo();
+    Serial.println("OK X");
+    return;
+  }
+
+  if (linea.charAt(0) != 'T' && linea.charAt(0) != 't') {
+    return;
+  }
+
+  int primeraDivision = linea.indexOf(':');
+  int segundaDivision = linea.indexOf(':', primeraDivision + 1);
+
+  if (primeraDivision < 0 || segundaDivision < 0) {
+    return;
+  }
+
+  String listaTeclas = linea.substring(primeraDivision + 1, segundaDivision);
+  unsigned long duracion = (unsigned long)linea.substring(segundaDivision + 1).toInt();
+
+  if (duracion == 0) {
+    duracion = 600;
+  }
+
+  if (duracion > MAXIMO_MS) {
+    duracion = MAXIMO_MS;
+  }
+
+  bool pedida[NUM_TECLAS];
+
+  for (byte i = 0; i < NUM_TECLAS; i++) {
+    pedida[i] = false;
+  }
+
+  int cuantas = 0;
+
+  while (listaTeclas.length() > 0) {
+    int coma = listaTeclas.indexOf(',');
+    String pedazo;
+
+    if (coma < 0) {
+      pedazo = listaTeclas;
+      listaTeclas = "";
     } else {
-      mensajeRecibido += caracter;
+      pedazo = listaTeclas.substring(0, coma);
+      listaTeclas = listaTeclas.substring(coma + 1);
+    }
+
+    pedazo.trim();
+
+    if (pedazo.length() == 0) {
+      continue;
+    }
+
+    int tecla = pedazo.toInt();
+
+    if (tecla >= 0 && tecla < NUM_TECLAS && !pedida[tecla]) {
+      pedida[tecla] = true;
+      cuantas++;
     }
   }
 
-  // 2. TEMPORIZADORES EN SEGUNDO PLANO
-  if (modoMelodia) {
-    // Máquina de estados de melodías
-    if (notaIndex != -1 && notaIndex < totalNotasActual) {
-      unsigned long tiempoActual = millis();
-      
-      if (!notaEnProgreso) {
-        apagarTodosLosRelevadores();
-        int pin = melodiaActual[notaIndex].pinRele;
-        if (pin != 0) {
-          digitalWrite(pin, LOW); 
-        }
-        tiempoNotaAnterior = tiempoActual;
-        notaEnProgreso = true;
-      } 
-      else {
-        if (tiempoActual - tiempoNotaAnterior >= (unsigned long)melodiaActual[notaIndex].duracionMs) {
-          apagarTodosLosRelevadores(); 
-          notaEnProgreso = false;
-          notaIndex++; 
-          
-          if (notaIndex >= totalNotasActual) {
-            notaIndex = -1; 
-            melodiaActual = NULL;
-          }
-        }
+  unsigned long ahora = millis();
+
+  // Soltar las notas viejas que ya no se piden.
+  if (CORTAR_ANTERIOR) {
+    for (byte i = 0; i < NUM_TECLAS; i++) {
+
+      if (pedida[i] || !pisada[i]) {
+        continue;
       }
+
+      unsigned long minimo = pisada_desde[i] + MINIMO_PISADO_MS;
+
+      soltar_en[i] = (ahora > minimo) ? ahora : minimo;
     }
-  } else {
-    // Temporizador automático de Nota Individual (500 ms)
-    if (pinNotaActivo != -1 && (millis() - tiempoActivacionNota >= DURACION_NOTA)) {
-      apagarTodosLosRelevadores();
+  }
+
+  // Las notas nuevas.
+  for (byte i = 0; i < NUM_TECLAS; i++) {
+
+    if (!pedida[i]) {
+      continue;
+    }
+
+    if (pisada[i] || repisar_en[i] != 0) {
+      soltarTecla(i);
+
+      repisar_en[i] = ahora + SEPARACION_REPIQUE_MS;
+      soltar_en[i] = repisar_en[i] + duracion;
+
+    } else {
+      pisarTecla(i, ahora);
+
+      repisar_en[i] = 0;
+      soltar_en[i] = ahora + duracion;
+    }
+  }
+
+  Serial.print("OK ");
+  Serial.println(cuantas);
+}
+
+/* ---------- tiempos ---------- */
+
+void atenderTiempos() {
+  unsigned long ahora = millis();
+
+  for (byte i = 0; i < NUM_TECLAS; i++) {
+
+    if (repisar_en[i] != 0 && (long)(ahora - repisar_en[i]) >= 0) {
+      pisarTecla(i, ahora);
+      repisar_en[i] = 0;
+    }
+
+    if (pisada[i] && soltar_en[i] != 0 && (long)(ahora - soltar_en[i]) >= 0) {
+      soltarTecla(i);
+      soltar_en[i] = 0;
     }
   }
 }
 
-// Lógica para reproducir Melodías Completas
-void procesarModoMelodia(String estado) {
-  if (estado == "ALEGRIA") {
-    melodiaActual = mel_alegria;
-    totalNotasActual = NOTAS_ALEGRIA;
-    iniciarSecuencia();
-  } 
-  else if (estado == "TRISTEZA") {
-    melodiaActual = mel_tristeza;
-    totalNotasActual = NOTAS_TRISTEZA;
-    iniciarSecuencia();
-  } 
-  else if (estado == "SORPRESA") {
-    melodiaActual = mel_sorpresa;
-    totalNotasActual = NOTAS_SORPRESA;
-    iniciarSecuencia();
-  } 
-  else if (estado == "IRA") {
-    melodiaActual = mel_ira;
-    totalNotasActual = NOTAS_IRA;
-    iniciarSecuencia();
-  } 
-  else if (estado == "ABURRIMIENTO") {
-    melodiaActual = mel_aburrimiento;
-    totalNotasActual = NOTAS_ABURRIMIENTO;
-    iniciarSecuencia();
+/* ---------- teclas ---------- */
+
+void pisarTecla(byte tecla, unsigned long ahora) {
+  pisada[tecla] = true;
+  pisada_desde[tecla] = ahora;
+
+  if (PINES[tecla] == SIN_CONECTAR) {
+    return;
   }
-  else if (estado == "REPOSO") {
-    resetearEstados();
+
+  digitalWrite(PINES[tecla], ACTIVA_EN_BAJO ? LOW : HIGH);
+}
+
+void soltarTecla(byte tecla) {
+  pisada[tecla] = false;
+
+  if (PINES[tecla] == SIN_CONECTAR) {
+    return;
   }
+
+  digitalWrite(PINES[tecla], ACTIVA_EN_BAJO ? HIGH : LOW);
 }
 
-// Lógica para reproducir Notas Únicas de 500 ms
-void procesarModoNota(String nota) {
-  apagarTodosLosRelevadores(); 
-  
-  if (nota == "C") { digitalWrite(RELE_DO, LOW);  pinNotaActivo = RELE_DO;  tiempoActivacionNota = millis(); }
-  else if (nota == "D") { digitalWrite(RELE_RE, LOW);  pinNotaActivo = RELE_RE;  tiempoActivacionNota = millis(); }
-  else if (nota == "E") { digitalWrite(RELE_MI, LOW);  pinNotaActivo = RELE_MI;  tiempoActivacionNota = millis(); }
-  else if (nota == "F") { digitalWrite(RELE_FA, LOW);  pinNotaActivo = RELE_FA;  tiempoActivacionNota = millis(); }
-  else if (nota == "G") { digitalWrite(RELE_SOL, LOW); pinNotaActivo = RELE_SOL; tiempoActivacionNota = millis(); }
-  else if (nota == "0" || nota == "REPOSO") { pinNotaActivo = -1; }
-}
-
-void iniciarSecuencia() {
-  notaIndex = 0;
-  notaEnProgreso = false;
-}
-
-void resetearEstados() {
-  notaIndex = -1;
-  melodiaActual = NULL;
-  notaEnProgreso = false;
-  pinNotaActivo = -1;
-  apagarTodosLosRelevadores();
-}
-
-void apagarTodosLosRelevadores() {
-  digitalWrite(RELE_DO, HIGH);
-  digitalWrite(RELE_RE, HIGH);
-  digitalWrite(RELE_MI, HIGH);
-  digitalWrite(RELE_FA, HIGH);
-  digitalWrite(RELE_SOL, HIGH);
-  digitalWrite(RELE_LA, HIGH);
-  digitalWrite(RELE_SI, HIGH);
+void soltarTodo() {
+  for (byte i = 0; i < NUM_TECLAS; i++) {
+    soltarTecla(i);
+    soltar_en[i] = 0;
+    repisar_en[i] = 0;
+  }
 }

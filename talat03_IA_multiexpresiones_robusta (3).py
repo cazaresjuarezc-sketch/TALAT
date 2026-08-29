@@ -6,6 +6,9 @@ import threading
 from PIL import ImageTk
 import json
 import os
+import sqlite3
+import csv
+from tkinter import messagebox
 from math import dist
 from datetime import datetime
 
@@ -33,15 +36,21 @@ app.configure(
 # ==========================================
 
 NEGRO = "#000000"
+NEGRO2 = "#1A1A1A"
 BLANCO = "#FFFFFF"
 AZUL = "#3B9DFF"
 MORADO = "#9B4DFF"
 GRIS = "#BFBFBF"
+GRIS2 = "#2B2B2B"
+GRIS3 = "#5A5A5A"
+GRIS4 = "#333333"
 MORADO2 = "#5D2AA6"
 ROJO = "#FF0000"
 AMARILLO = "#FFD63D"
 VERDE = "#4CF405"
 CELESTE = "#05CEFA"
+NARANJA = "#FF9F43"
+ROJOOS = "#B22222"
 
 # ==========================================
 # MEDIAPIPE
@@ -62,10 +71,611 @@ camara_activa = False
 frame_camara = None
 
 # ==========================================
-# MINI BASE DE DATOS TALAT
+# BASE DE DATOS SQL TALAT
+# ==========================================
+# La app conserva su estructura interna de diccionarios para que toda la
+# interfaz y la lógica existente sigan funcionando igual, pero la
+# persistencia real queda en SQLite.
+BASE_DATOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datos")
+os.makedirs(BASE_DATOS_DIR, exist_ok=True)
+ARCHIVO_BD = os.path.join(BASE_DATOS_DIR, "talat.db")
+ARCHIVO_USUARIOS = "usuarios.json"          # solo migración inicial
+ARCHIVO_CSV_LEGADO = "graficaparaimprimir_talat.csv"  # solo migración/exportación
+
+def conexion_bd():
+    conn = sqlite3.connect(ARCHIVO_BD, timeout=10)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def inicializar_base_datos():
+    with conexion_bd() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id_usuario INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL UNIQUE,
+                edad TEXT DEFAULT '',
+                motivo TEXT DEFAULT '',
+                comentarios TEXT DEFAULT '',
+                sesiones INTEGER DEFAULT 0,
+                tiempo_total INTEGER DEFAULT 0,
+                expresiones INTEGER DEFAULT 0,
+                notas INTEGER DEFAULT 0,
+                canciones_completadas INTEGER DEFAULT 0,
+                ultima_sesion TEXT DEFAULT '',
+                fecha_alta TEXT DEFAULT CURRENT_TIMESTAMP,
+                activo INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS sesiones (
+                id_sesion INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_usuario INTEGER NOT NULL,
+                fecha TEXT NOT NULL,
+                duracion_segundos INTEGER DEFAULT 0,
+                total_expresiones INTEGER DEFAULT 0,
+                total_notas INTEGER DEFAULT 0,
+                FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS expresiones (
+                id_expresion INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_sesion INTEGER NOT NULL,
+                emocion TEXT NOT NULL,
+                emoji TEXT DEFAULT '',
+                apertura_boca REAL,
+                ancho_boca REAL,
+                apertura_ojos REAL,
+                altura_ceja REAL,
+                cercania_cejas REAL,
+                curva_boca REAL,
+                comparacion TEXT DEFAULT '',
+                momento TEXT DEFAULT '',
+                FOREIGN KEY (id_sesion) REFERENCES sesiones(id_sesion) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS instrumento_libre (
+                id_instrumento INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_usuario INTEGER NOT NULL UNIQUE,
+                datos_json TEXT NOT NULL DEFAULT '[]',
+                fecha_actualizacion TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS canciones_completadas (
+                id_cancion_completada INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_usuario INTEGER NOT NULL,
+                clave_cancion TEXT NOT NULL,
+                titulo TEXT DEFAULT '',
+                aciertos INTEGER DEFAULT 0,
+                fecha TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS eventos (
+                id_evento INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_usuario INTEGER,
+                fecha_hora TEXT NOT NULL,
+                registro TEXT NOT NULL,
+                descripcion TEXT DEFAULT '',
+                duracion_min TEXT DEFAULT '',
+                expresiones TEXT DEFAULT '',
+                expresion TEXT DEFAULT '',
+                intensidad TEXT DEFAULT '',
+                comparacion TEXT DEFAULT '',
+                observaciones TEXT DEFAULT '',
+                FOREIGN KEY (id_usuario) REFERENCES usuarios(id_usuario) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sesiones_usuario ON sesiones(id_usuario);
+            CREATE INDEX IF NOT EXISTS idx_expresiones_sesion ON expresiones(id_sesion);
+            CREATE INDEX IF NOT EXISTS idx_eventos_usuario ON eventos(id_usuario);
+            CREATE INDEX IF NOT EXISTS idx_eventos_fecha ON eventos(fecha_hora);
+        """)
+
+def migrar_json_y_csv_anteriores():
+    """Migra una instalación anterior una sola vez, sin volver a escribir JSON."""
+    try:
+        with conexion_bd() as conn:
+            if conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0] == 0 and os.path.exists(ARCHIVO_USUARIOS):
+                with open(ARCHIVO_USUARIOS, "r", encoding="utf-8") as archivo:
+                    datos = json.load(archivo)
+                if isinstance(datos, dict):
+                    for nombre, usuario in datos.items():
+                        if not isinstance(usuario, dict):
+                            continue
+                        conn.execute("""
+                            INSERT OR IGNORE INTO usuarios
+                            (nombre, edad, motivo, comentarios, sesiones, tiempo_total,
+                             expresiones, notas, canciones_completadas, ultima_sesion)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (nombre, usuario.get("edad", ""), usuario.get("motivo", ""),
+                              usuario.get("comentarios", ""), usuario.get("sesiones", 0),
+                              usuario.get("tiempo_total", 0), usuario.get("expresiones", 0),
+                              usuario.get("notas", 0), usuario.get("canciones_completadas", 0),
+                              usuario.get("ultima_sesion", "")))
+                        uid = conn.execute("SELECT id_usuario FROM usuarios WHERE nombre=?", (nombre,)).fetchone()[0]
+                        for sesion in usuario.get("historial_sesiones", []) or []:
+                            cur = conn.execute("""
+                                INSERT INTO sesiones (id_usuario, fecha, duracion_segundos, total_expresiones, total_notas)
+                                VALUES (?, ?, ?, ?, ?)
+                            """, (uid, sesion.get("fecha", ""), sesion.get("duracion_segundos", 0),
+                                  sesion.get("total_expresiones", 0), sesion.get("total_notas", 0)))
+                            sid = cur.lastrowid
+                            for exp in sesion.get("expresiones", []) or []:
+                                conn.execute("""
+                                    INSERT INTO expresiones
+                                    (id_sesion, emocion, emoji, apertura_boca, ancho_boca, apertura_ojos,
+                                     altura_ceja, cercania_cejas, curva_boca, comparacion, momento)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (sid, exp.get("emocion", ""), exp.get("emoji", ""), exp.get("apertura_boca"),
+                                      exp.get("ancho_boca"), exp.get("apertura_ojos"), exp.get("altura_ceja"),
+                                      exp.get("cercania_cejas"), exp.get("curva_boca"), exp.get("comparacion", ""),
+                                      exp.get("momento", "")))
+                        instrumento = usuario.get("instrumento_libre", []) or []
+                        if instrumento:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO instrumento_libre (id_usuario, datos_json, fecha_actualizacion)
+                                VALUES (?, ?, CURRENT_TIMESTAMP)
+                            """, (uid, json.dumps(instrumento, ensure_ascii=False)))
+            if conn.execute("SELECT COUNT(*) FROM eventos").fetchone()[0] == 0 and os.path.exists(ARCHIVO_CSV_LEGADO):
+                with open(ARCHIVO_CSV_LEGADO, "r", encoding="utf-8-sig", newline="") as archivo:
+                    for fila in csv.DictReader(archivo):
+                        nombre = (fila.get("Persona") or "-").strip()
+                        encontrado = conn.execute("SELECT id_usuario FROM usuarios WHERE nombre=?", (nombre,)).fetchone() if nombre not in ("", "-") else None
+                        uid = encontrado[0] if encontrado else None
+                        try:
+                            fh = datetime.strptime(f"{fila.get('Fecha','')} {fila.get('Hora','')}", "%d/%m/%Y %H:%M").strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            fh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        conn.execute("""
+                            INSERT INTO eventos
+                            (id_usuario, fecha_hora, registro, descripcion, duracion_min, expresiones,
+                             expresion, intensidad, comparacion, observaciones)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (uid, fh, fila.get("Registro", ""), fila.get("Qué ocurrió", ""),
+                              fila.get("Duración (min)", ""), fila.get("Expresiones logradas", ""),
+                              fila.get("Expresión trabajada", ""), fila.get("Intensidad", ""),
+                              fila.get("Comparación con la vez anterior", ""), fila.get("Observaciones de la terapeuta", "")))
+    except Exception as e:
+        print("No se pudo completar la migración a SQL:", e)
+
+inicializar_base_datos()
+migrar_json_y_csv_anteriores()
+
+# ==========================================
+# IDIOMA
+# ==========================================
+#
+ARCHIVO_CONFIGURACION = "configuracion.json"
+
+TRADUCCION_EN = {
+    # --- bienvenida ---
+    "Bienvenido": "Welcome",
+    "🎹 INICIO": "🎹 START",
+    "⚙ Idioma": "⚙ Language",
+    "La música al alcance de todos": "Music within everyone's reach",
+    "Sistema Musical TALAT": "TALAT Music System",
+
+    # --- usuarios ---
+    "Usuarios": "Users",
+    "➕ Agregar usuario": "➕ Add user",
+    "📊 Ver perfil": "📊 View profile",
+    "← Bienvenido": "← Welcome",
+    "📄 Gráfica para imprimir": "📄 Printable graph",
+    "Nuevo usuario": "New user",
+    "Editar usuario": "Edit user",
+    "✏ Editar usuario": "✏ Edit user",
+    "🗑 Eliminar usuario": "🗑 Delete user",
+    "▶ Iniciar sesión": "▶ Start session",
+    "Nombre": "Name",
+    "Edad": "Age",
+    "Nombre de la persona": "Person's name",
+    "Años cumplidos": "Years old",
+    "¿Por qué usa TALAT?": "Why do they use TALAT?",
+    "Escríbelo con tus palabras. Este texto aparecerá en su perfil.":
+        "Write it in your own words. It will appear in their profile.",
+    "Guardar": "Save",
+    "Cancelar": "Cancel",
+    "Cerrar": "Close",
+    "El nombre no puede quedar vacío.": "The name cannot be empty.",
+    "La edad debe ser un número.": "Age must be a number.",
+    "La edad debe estar entre 1 y 120.": "Age must be between 1 and 120.",
+    "Aún no hay usuarios registrados.\n\nPresiona 'Agregar usuario' para comenzar.":
+        "No users yet.\n\nPress 'Add user' to begin.",
+    "Sin datos personales · edítalos desde su perfil":
+        "No personal data · edit it from their profile",
+
+    # --- sesión ---
+    "🎵 Sesión TALAT": "🎵 TALAT Session",
+    "⏹ Terminar sesión": "⏹ End session",
+    "🔧 Probar piano": "🔧 Test piano",
+    "📷 Cámara TALAT": "📷 TALAT Camera",
+    "🔌 Buscando el piano...": "🔌 Looking for the piano...",
+    "🔌 No hay piano conectado": "🔌 No piano connected",
+    "🧠 Modo Terapia": "🧠 Therapy Mode",
+    "🎼 Canción Guiada": "🎼 Guided Song",
+    "🎛 Modo Libre": "🎛 Free Mode",
+    "SONIDO": "SOUND",
+    "🎵 Notas": "🎵 Notes",
+    "🎹 Acordes": "🎹 Chords",
+    "REPOSO": "AT REST",
+    "CALIBRANDO": "CALIBRATING",
+    "ALEGRÍA": "JOY",
+    "SORPRESA": "SURPRISE",
+    "TRISTEZA": "SADNESS",
+    "IRA": "ANGER",
+    "ABURRIMIENTO": "BOREDOM",
+    "Haz una expresión": "Make an expression",
+    "Mantén la expresión": "Hold the expression",
+    "¡Muy bien!": "Very good!",
+    "Excelente": "Excellent",
+    "Muy bien": "Well done",
+    "¡Excelente!": "Excellent!",
+    "Mantén tu rostro relajado": "Keep your face relaxed",
+    "Mantén tu rostro relajado...": "Keep your face relaxed...",
+    "Calibración completada": "Calibration complete",
+    "INSTRUCCIÓN: Haz una expresión clara y mantenla unos instantes.":
+        "INSTRUCTION: Make a clear expression and hold it for a moment.",
+    "INSTRUCCIÓN: No sonrías ni hagas gestos. Mira al frente y mantén el rostro relajado.":
+        "INSTRUCTION: Don't smile or make faces. Look ahead and keep your face relaxed.",
+    "INSTRUCCIÓN: Mantén tu rostro relajado mientras TALAT calibra tu rostro.":
+        "INSTRUCTION: Keep your face relaxed while TALAT calibrates it.",
+
+    # --- canción guiada ---
+    "🎼 ELIGE UNA CANCIÓN": "🎼 CHOOSE A SONG",
+    "Una sola expresión toca una frase completa de la melodía.":
+        "A single expression plays a whole phrase of the melody.",
+    "▶ TOCAR ESTA CANCIÓN": "▶ PLAY THIS SONG",
+    "← Canciones": "← Songs",
+    "▶ INICIAR": "▶ START",
+    "⏸ PAUSA": "⏸ PAUSE",
+    "↻ REINICIAR": "↻ RESTART",
+    "Fácil": "Easy",
+    "Media": "Medium",
+    "Larga": "Long",
+    "Esperando tu expresión...": "Waiting for your expression...",
+    "Relaja la cara para la siguiente frase": "Relax your face for the next phrase",
+    "Pulsa ▶ INICIAR para empezar": "Press ▶ START to begin",
+    "⏸ En pausa": "⏸ Paused",
+    "Haz esta expresión una vez": "Make this expression once",
+    "Escucha y descansa...": "Listen and rest...",
+    "Puedes relajar la cara": "You can relax your face",
+    "Sigue las notas amarillas mientras suena la melodía.":
+        "Follow the yellow notes while the melody plays.",
+    "🎉 ¡CANCIÓN COMPLETADA!": "🎉 SONG COMPLETED!",
+    "Cara de alegría": "Happy face",
+    "Cara de sorpresa": "Surprised face",
+    "Cara de enojo": "Angry face",
+    "Cara de tristeza": "Sad face",
+    "Cara de aburrimiento": "Bored face",
+    "Sonríe estirando la boca y subiendo las esquinas.":
+        "Smile, stretching your mouth and lifting the corners.",
+    "Abre la boca y sube las cejas, con los ojos bien abiertos.":
+        "Open your mouth and raise your eyebrows, eyes wide open.",
+    "Frunce el ceño juntando las cejas hacia abajo.":
+        "Frown, pulling your eyebrows down and together.",
+    "Baja las esquinas de la boca y saca un poco el labio de abajo.":
+        "Lower the corners of your mouth and push out your bottom lip.",
+    "Entrecierra los ojos y relaja la cara, como si tuvieras sueño.":
+        "Narrow your eyes and relax your face, as if you were sleepy.",
+    "frases": "phrases",
+    "segundos de música": "seconds of music",
+    "2 frases · 2 expresiones": "2 phrases · 2 expressions",
+    "3 frases · 3 expresiones": "3 phrases · 3 expressions",
+
+    # --- modo libre ---
+    "🎛 MODO LIBRE": "🎛 FREE MODE",
+    "Tú eliges el sonido y tú grabas la cara que lo toca.":
+        "You choose the sound and record the face that plays it.",
+    "➕ Agregar sonido": "➕ Add sound",
+    "Agrega un sonido y graba su gesto.": "Add a sound and record its gesture.",
+    "Haz uno de tus gestos.": "Make one of your gestures.",
+    "🎬 ¡Mantén el gesto!": "🎬 Hold the gesture!",
+    "●  Sin gesto grabado": "●  No gesture recorded",
+    "🎬 Grabar": "🎬 Record",
+    "🔄 Regrabar": "🔄 Re-record",
+    "Ocho sonidos es el máximo.": "Eight sounds is the maximum.",
+    "Espera a que termine la calibración.": "Wait for calibration to finish.",
+    "Todavía no hay sonidos.\nPulsa «Agregar sonido» para empezar.":
+        "No sounds yet.\nPress «Add sound» to begin.",
+    "Elegir sonido": "Choose sound",
+    "Toca una tecla para escucharla y asignarla.":
+        "Tap a key to hear it and assign it.",
+    "Las notas en gris solo suenan en la computadora:\nel piano físico tiene ocho teclas.":
+        "Grey notes only play on the computer:\nthe physical piano has eight keys.",
+    "Ese gesto es muy suave. Haz un movimiento más marcado.":
+        "That gesture is too soft. Make a stronger movement.",
+    "No se detectó ningún movimiento.": "No movement was detected.",
+
+    # --- perfil ---
+    "← Usuarios": "← Users",
+    "Resumen de tu práctica en TALAT": "Summary of your TALAT practice",
+    "🪪 Datos de la persona": "🪪 Personal information",
+    "Edad: sin registrar": "Age: not recorded",
+    "Sin registrar": "Not recorded",
+    "📊 Estadísticas": "📊 Statistics",
+    "Tu progreso en las últimas 10 sesiones": "Your progress over the last 10 sessions",
+    "Expresiones": "Expressions",
+    "Minutos": "Minutes",
+    "🔍 Ver cómo te ha ido": "🔍 See how it has gone",
+    "📝 Comentarios": "📝 Notes",
+    "Tiempo total: 0 min": "Total time: 0 min",
+    "Sesiones realizadas: 0": "Sessions completed: 0",
+    "Última sesión: Sin sesiones": "Last session: No sessions",
+    "Expresiones registradas: 0": "Expressions recorded: 0",
+    "Notas detectadas: 0": "Notes detected: 0",
+    "Cada barra responde una pregunta sencilla sobre lo que hizo tu cara. Entre más llena y más verde, más marcado te salió el movimiento.":
+        "Each bar answers a simple question about what your face did. The fuller and greener it is, the stronger the movement was.",
+    "Tiempo total:": "Total time:",
+    "Sesiones realizadas:": "Sessions completed:",
+    "Expresiones registradas:": "Expressions recorded:",
+    "Notas detectadas:": "Notes detected:",
+    "Última sesión:": "Last session:",
+    "Sin sesiones": "No sessions",
+
+    # --- bitácora ---
+    "📄  Gráfica para imprimir de TALAT": "📄  TALAT printable graph",
+    "📊 Abrir en Excel": "📊 Open in Excel",
+    "📊 Abrir el registro (CSV)": "📊 Open the log (CSV)",
+    "📄 Gráfica para imprimir": "📄 Activity log",
+
+    # --- hoja para imprimir ---
+    "📄 Hoja para imprimir": "📄 Printable sheet",
+    "Hoja para imprimir": "Printable sheet",
+    "Primero abre el perfil de una persona.": "Open someone's profile first.",
+    "Todavía no hay sesiones de esta persona.": "This person has no sessions yet.",
+    "Cierra el archivo en Excel y vuelve a intentarlo.":
+        "Close the file in Excel and try again.",
+    "No se pudo generar el archivo": "The file could not be created",
+    "El archivo se guardó aquí:": "The file was saved here:",
+    "No se pudo abrir solo": "It could not be opened automatically",
+    "Reporte generado": "Report generated",
+    "Indicadores para la terapeuta": "Indicators for the therapist",
+    "Progreso por sesión": "Progress by session",
+    "Calidad de los movimientos": "Movement quality",
+    "Promedio por sesión": "Average per session",
+    "Duración promedio": "Average duration",
+    "Movimiento más practicado": "Most practiced movement",
+    "Cambio observado": "Observed change",
+    "Sin cambio suficiente para comparar": "Not enough data to compare",
+    "Primeras sesiones": "First sessions",
+    "Sesiones recientes": "Recent sessions",
+    "Reporte PDF de TALAT": "TALAT PDF Report",
+    "📄 Generar reporte PDF": "📄 Generate PDF report",
+    "Reporte de actividad TALAT": "TALAT Activity Report",
+    "Resumen general": "General summary",
+    "Historial de sesiones": "Session history",
+    "Actividad por movimiento": "Activity by movement",
+    "Observaciones de la terapeuta": "Therapist's notes",
+    "Fecha": "Date",
+    "Duración": "Duration",
+    "Expresiones realizadas": "Expressions completed",
+    "Sesión": "Session",
+    "Veces realizada": "Times completed",
+    "Intensidad": "Intensity",
+    "Sin datos": "No data",
+    "Reporte generado correctamente.": "Report generated successfully.",
+    "Todavía no hay nada registrado.": "Nothing recorded yet.",
+    "Todavía no hay nada registrado.\n\nInicia una sesión y vuelve a entrar aquí.":
+        "Nothing recorded yet.\n\nStart a session and come back here.",
+    "Abriendo...": "Opening...",
+
+    # --- idioma ---
+    "🌎  Idioma": "🌎  Language",
+    "Se guarda y la próxima vez TALAT abre en ese idioma.":
+        "It is saved and TALAT will open in that language next time.",
+    "Pronto habrá más idiomas.": "More languages coming soon.",
+
+    # --- textos dinámicos y ventanas secundarias ---
+    "Todo queda guardado en:": "Everything is saved in:",
+    "registros en total": "total records",
+    "se muestran los 300 más recientes": "showing the 300 most recent",
+    "Inicio de sesión": "Session started",
+    "Fin de sesión": "Session ended",
+    "Expresión lograda": "Expression achieved",
+    "Actividad completada": "Activity completed",
+    "Gesto personalizado": "Custom gesture",
+    "Alta de la persona": "Person added",
+    "Equipo": "Equipment",
+    "Configuración": "Settings",
+    "Marcada": "Strong",
+    "Moderada": "Moderate",
+    "Leve": "Mild",
+    "Aún no hay sesiones.\nInicia una sesión para ver tu progreso.":
+        "No sessions yet.\nStart a session to see your progress.",
+    "Todavía no hay sesiones.\n\nInicia una sesión y haz alguna expresión para que aquí aparezcan tus mediciones.":
+        "No sessions yet.\n\nStart a session and make an expression to see your measurements here.",
+    "Primera vez que haces esta expresión.": "First time making this expression.",
+    "Te salió igual que la vez anterior.": "It was the same as last time.",
+    "Te salió mejor que la vez anterior.": "You did better than last time.",
+    "Esta vez te salió un poco menos marcado.": "This time it was a little less pronounced.",
+    "Puedes relajar la cara": "You can relax your face",
+    "Pulsa ↻ REINICIAR para tocarla otra vez,\nla expresión volverá a aparecer.":
+        "Press ↻ RESTART to play it again,\nthe expression will appear again.",
+    "FRASE 1 DE 1": "PHRASE 1 OF 1",
+    "notas": "notes",
+    "frases": "phrases",
+    "segundos de música": "seconds of music",
+    "SONANDO LA FRASE": "PLAYING PHRASE",
+    "Ahora toca:": "Now play:",
+    "¿Seguro que quieres eliminar este usuario?": "Are you sure you want to delete this user?",
+    "El usuario fue eliminado.": "The user was deleted.",
+    "El usuario no pudo eliminarse.": "The user could not be deleted.",
+    "No se encontró el usuario.": "The user was not found.",
+    "0 de 8 sonidos": "0 of 8 sounds"
+
+}
+
+TRADUCCION_ES = {v: k for k, v in TRADUCCION_EN.items()}
+
+TEXTOS = {
+    "es": {"_nombre": "Español", "_bandera": "🇲🇽"},
+    "en": {"_nombre": "English", "_bandera": "🇺🇸"}
+}
+
+IDIOMA = "es"
+
+
+def cargar_configuracion():
+    if not os.path.exists(ARCHIVO_CONFIGURACION):
+        return {}
+
+    try:
+        with open(ARCHIVO_CONFIGURACION, "r", encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+            return datos if isinstance(datos, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def guardar_configuracion(datos):
+    try:
+        with open(ARCHIVO_CONFIGURACION, "w", encoding="utf-8") as archivo:
+            json.dump(datos, archivo, ensure_ascii=False, indent=4)
+    except OSError as e:
+        print("No se pudo guardar la configuración:", e)
+
+
+configuracion = cargar_configuracion()
+
+if configuracion.get("idioma") in TEXTOS:
+    IDIOMA = configuracion["idioma"]
+
+
+def traducir(texto):
+    """
+    Pasa un texto al idioma actual.
+
+    Si no está en la tabla lo deja igual: así los nombres propios
+    (las canciones, las notas DO-RE-MI) nunca se tocan.
+    """
+    if not isinstance(texto, str) or not texto.strip():
+        return texto
+
+    limpio = texto.strip()
+
+    if IDIOMA == "en":
+        return TRADUCCION_EN.get(limpio, texto)
+
+    return TRADUCCION_ES.get(limpio, texto)
+
+
+def t(clave):
+    """Se conserva por compatibilidad: traduce el texto que reciba."""
+    return traducir(clave)
+
+
+def traducir_ventana(ventana):
+    """Traduce textos visibles, opciones y títulos de ventanas."""
+    try:
+        titulo = ventana.title()
+        nuevo_titulo = traducir(titulo)
+        if nuevo_titulo != titulo:
+            ventana.title(nuevo_titulo)
+    except Exception:
+        pass
+
+    try:
+        texto = ventana.cget("text")
+        nuevo = traducir(texto)
+        if nuevo != texto:
+            ventana.configure(text=nuevo)
+    except Exception:
+        pass
+
+    try:
+        valores = ventana.cget("values")
+        if valores:
+            actual = ventana.get()
+            ventana.configure(values=[traducir(v) for v in valores])
+            ventana.set(traducir(actual))
+    except Exception:
+        pass
+
+    try:
+        for hijo in ventana.winfo_children():
+            traducir_ventana(hijo)
+    except Exception:
+        pass
+
+
+# ==========================================
+# GRAFICA PARA IMPRMIR
 # ==========================================
 
-ARCHIVO_USUARIOS = "usuarios.json"
+ARCHIVO_GRAFICA_PARA_IMPRIMIR = "graficaparaimprimir_talat.csv"
+
+COLUMNAS_GRAFICA_PARA_IMPRIMIR = [
+    "Fecha", "Hora", "Persona", "Edad",
+    "Registro", "Qué ocurrió",
+    "Duración (min)", "Expresiones logradas",
+    "Expresión trabajada", "Intensidad",
+    "Comparación con la vez anterior",
+    "Observaciones de la terapeuta"
+]
+
+def registrar_evento(registro, descripcion="", usuario=None,
+                     duracion_min="", expresiones="",
+                     expresion="", intensidad="", comparacion=""):
+    """Guarda la bitácora en SQL. La app sigue usando la misma función."""
+    try:
+        usuario = usuario if usuario is not None else (usuario_actual or "-")
+        with conexion_bd() as conn:
+            fila = conn.execute("SELECT id_usuario FROM usuarios WHERE nombre=?", (usuario,)).fetchone() if usuario != "-" else None
+            uid = fila[0] if fila else None
+            conn.execute("""
+                INSERT INTO eventos
+                (id_usuario, fecha_hora, registro, descripcion, duracion_min, expresiones,
+                 expresion, intensidad, comparacion, observaciones)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (uid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), registro, descripcion,
+                  duracion_min, expresiones, expresion, intensidad, comparacion, ""))
+    except Exception as e:
+        print("No se pudo guardar el evento SQL:", e)
+
+def exportar_bitacora_csv():
+    """Genera el CSV desde SQL únicamente cuando la interfaz lo necesita."""
+    try:
+        with conexion_bd() as conn:
+            filas = conn.execute("""
+                SELECT strftime('%d/%m/%Y', e.fecha_hora), strftime('%H:%M', e.fecha_hora),
+                       COALESCE(u.nombre, '-'), COALESCE(u.edad, ''), e.registro, e.descripcion,
+                       e.duracion_min, e.expresiones, e.expresion, e.intensidad,
+                       e.comparacion, e.observaciones
+                FROM eventos e LEFT JOIN usuarios u ON u.id_usuario=e.id_usuario
+                ORDER BY e.id_evento ASC
+            """).fetchall()
+        with open(ARCHIVO_GRAFICA_PARA_IMPRIMIR, "w", newline="", encoding="utf-8-sig") as archivo:
+            escritor=csv.writer(archivo)
+            escritor.writerow(COLUMNAS_GRAFICA_PARA_IMPRIMIR)
+            escritor.writerows(filas)
+        return True
+    except Exception as e:
+        print("No se pudo generar la bitácora CSV:", e)
+        return False
+def intensidad_en_palabras(emocion, medicion):
+    """
+    Traduce la medición a Leve / Moderada / Marcada.
+
+    Mira la medición que de verdad importa en esa expresión: en la
+    alegría la sonrisa, en el enojo el ceño. Un número de cinco
+    decimales no le dice nada a nadie; esta palabra sí.
+    """
+    try:
+        clave = LO_QUE_IMPORTA.get(emocion, ["apertura_boca"])[0]
+
+        if clave not in medicion:
+            return ""
+
+        proporcion = porcentaje_medicion(clave, medicion[clave])
+
+        if LOGRO_POR_MEDICION.get(clave, {}).get("invertida"):
+            proporcion = 1.0 - proporcion
+
+        if proporcion < 0.34:
+            return "Leve"
+
+        if proporcion < 0.67:
+            return "Moderada"
+
+        return "Marcada"
+
+    except Exception:
+        return ""
+
 
 usuario_actual = None
 hora_inicio_sesion = None
@@ -78,22 +688,81 @@ registros_expresiones_sesion = []
 contador_frames = 0
 
 def cargar_usuarios():
-    if not os.path.exists(ARCHIVO_USUARIOS):
-        return {}
-
+    """Carga desde SQL y devuelve el mismo diccionario que esperaba la app."""
+    datos={}
     try:
-        with open(ARCHIVO_USUARIOS, "r", encoding="utf-8") as archivo:
-            datos = json.load(archivo)
-            return datos if isinstance(datos, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
+        with conexion_bd() as conn:
+            usuarios=conn.execute("""
+                SELECT id_usuario,nombre,edad,motivo,comentarios,sesiones,tiempo_total,
+                       expresiones,notas,canciones_completadas,ultima_sesion
+                FROM usuarios WHERE activo=1 ORDER BY nombre COLLATE NOCASE
+            """).fetchall()
+            for uid,nombre,edad,motivo,comentarios,sesiones,tiempo_total,expresiones,notas,canciones,ultima in usuarios:
+                historial=[]
+                for sid,fecha,duracion,total_exp,total_notas in conn.execute("""
+                    SELECT id_sesion,fecha,duracion_segundos,total_expresiones,total_notas
+                    FROM sesiones WHERE id_usuario=? ORDER BY id_sesion
+                """,(uid,)).fetchall():
+                    exps=[]
+                    for e in conn.execute("""
+                        SELECT emocion,emoji,apertura_boca,ancho_boca,apertura_ojos,altura_ceja,
+                               cercania_cejas,curva_boca,comparacion,momento
+                        FROM expresiones WHERE id_sesion=? ORDER BY id_expresion
+                    """,(sid,)).fetchall():
+                        exps.append({"emocion":e[0],"emoji":e[1],"apertura_boca":e[2],"ancho_boca":e[3],
+                                     "apertura_ojos":e[4],"altura_ceja":e[5],"cercania_cejas":e[6],
+                                     "curva_boca":e[7],"comparacion":e[8],"momento":e[9]})
+                    historial.append({"fecha":fecha,"duracion_segundos":duracion or 0,
+                                      "total_expresiones":total_exp or 0,"total_notas":total_notas or 0,
+                                      "expresiones":exps})
+                inst=conn.execute("SELECT datos_json FROM instrumento_libre WHERE id_usuario=?",(uid,)).fetchone()
+                try: instrumento=json.loads(inst[0]) if inst else []
+                except Exception: instrumento=[]
+                datos[nombre]={"sesiones":sesiones or 0,"tiempo_total":tiempo_total or 0,
+                    "expresiones":expresiones or 0,"notas":notas or 0,"canciones_completadas":canciones or 0,
+                    "ultima_sesion":ultima or "","comentarios":comentarios or "","historial_sesiones":historial,
+                    "edad":edad or "","motivo":motivo or "","instrumento_libre":instrumento}
+    except Exception as e:
+        print("No se pudieron cargar los usuarios desde SQL:",e)
+    return datos
 
 def guardar_usuarios(datos):
+    """Persiste en SQL el mismo modelo de datos que usa actualmente la interfaz."""
     try:
-        with open(ARCHIVO_USUARIOS, "w", encoding="utf-8") as archivo:
-            json.dump(datos, archivo, ensure_ascii=False, indent=4)
-    except OSError as e:
-        print("No se pudieron guardar los usuarios:", e)
+        with conexion_bd() as conn:
+            existentes={n:u for u,n in conn.execute("SELECT id_usuario,nombre FROM usuarios").fetchall()}
+            for uid,nombre in list(existentes.items()):
+                if nombre not in datos:
+                    conn.execute("UPDATE usuarios SET activo=0 WHERE id_usuario=?",(uid,))
+            for nombre,u in datos.items():
+                uid=existentes.get(nombre)
+                vals=(nombre,u.get("edad",""),u.get("motivo",""),u.get("comentarios",""),u.get("sesiones",0),
+                      u.get("tiempo_total",0),u.get("expresiones",0),u.get("notas",0),u.get("canciones_completadas",0),u.get("ultima_sesion",""))
+                if uid:
+                    conn.execute("""UPDATE usuarios SET nombre=?,edad=?,motivo=?,comentarios=?,sesiones=?,
+                                    tiempo_total=?,expresiones=?,notas=?,canciones_completadas=?,ultima_sesion=?,activo=1
+                                    WHERE id_usuario=?""",vals+(uid,))
+                else:
+                    uid=conn.execute("""INSERT INTO usuarios
+                        (nombre,edad,motivo,comentarios,sesiones,tiempo_total,expresiones,notas,canciones_completadas,ultima_sesion)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""",vals).lastrowid
+                conn.execute("DELETE FROM sesiones WHERE id_usuario=?",(uid,))
+                for sesion in u.get("historial_sesiones",[]) or []:
+                    sid=conn.execute("""INSERT INTO sesiones
+                        (id_usuario,fecha,duracion_segundos,total_expresiones,total_notas) VALUES (?,?,?,?,?)""",
+                        (uid,sesion.get("fecha",""),sesion.get("duracion_segundos",0),sesion.get("total_expresiones",0),sesion.get("total_notas",0))).lastrowid
+                    for e in sesion.get("expresiones",[]) or []:
+                        conn.execute("""INSERT INTO expresiones
+                            (id_sesion,emocion,emoji,apertura_boca,ancho_boca,apertura_ojos,altura_ceja,cercania_cejas,curva_boca,comparacion,momento)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",(sid,e.get("emocion",""),e.get("emoji",""),e.get("apertura_boca"),e.get("ancho_boca"),
+                            e.get("apertura_ojos"),e.get("altura_ceja"),e.get("cercania_cejas"),e.get("curva_boca"),e.get("comparacion",""),e.get("momento","")))
+                conn.execute("DELETE FROM instrumento_libre WHERE id_usuario=?",(uid,))
+                instrumento=u.get("instrumento_libre",[]) or []
+                if instrumento:
+                    conn.execute("INSERT INTO instrumento_libre (id_usuario,datos_json,fecha_actualizacion) VALUES (?,?,CURRENT_TIMESTAMP)",
+                                 (uid,json.dumps(instrumento,ensure_ascii=False)))
+    except Exception as e:
+        print("No se pudieron guardar los usuarios en SQL:",e)
 
 usuarios_db = cargar_usuarios()
 
@@ -106,11 +775,8 @@ for _nombre, _datos in usuarios_db.items():
     _datos.setdefault("ultima_sesion", "")
     _datos.setdefault("comentarios", "")
     _datos.setdefault("historial_sesiones", [])
-    # Datos personales: los usuarios creados antes de esta versión
-    # simplemente quedan vacíos hasta que se editen.
     _datos.setdefault("edad", "")
     _datos.setdefault("motivo", "")
-    # Instrumento del Modo Libre: los gestos que grabó esta persona.
     _datos.setdefault("instrumento_libre", [])
 
 def crear_datos_usuario():
@@ -339,7 +1005,6 @@ class DetectorGestos:
         return f[clave] - self.base[clave]
 
     def _clasificar(self, f):
-        # Diferencias respecto al rostro neutro de esta sesión.
         da_boca = self._delta(f, "ancho_boca")
         dap_boca = self._delta(f, "apertura_boca")
         dcurva = self._delta(f, "curva_boca")
@@ -504,37 +1169,43 @@ detector = DetectorGestos()
 
 
 # ==========================================
-# MOTOR DE NOTAS Y ACORDES (SONIDO)
+# NOTAS
 # ==========================================
-#
-# Aquí se produce el sonido. Un acorde son varias notas sonando a la vez.
-# Cuando el proyecto pase a la Raspberry Pi con los relevadores SSR,
-# solo hay que rellenar enviar_a_hardware(): recibe la lista de notas
-# del acorde y activa un relevador por cada una.
+
+
+NOTAS = [
+    "DO", "DO#", "RE", "RE#", "MI", "FA",
+    "FA#", "SOL", "SOL#", "LA", "LA#", "SI"
+]
+
+FRECUENCIA_DO = 261.63
 
 FRECUENCIAS_NOTAS = {
-    "DO": 261.63,
-    "RE": 293.66,
-    "MI": 329.63,
-    "FA": 349.23,
-    "SOL": 392.00,
-    "LA": 440.00,
-    "SI": 493.88,
-    # Segunda octava, necesaria para completar los acordes.
-    "DO5": 523.25,
-    "RE5": 587.33,
-    "MI5": 659.25,
-    "FA5": 698.46,
-    "SOL5": 783.99
+    nota: FRECUENCIA_DO * (2 ** (posicion / 12))
+    for posicion, nota in enumerate(NOTAS)
 }
 
-# Cuando conectes el piano físico, asigna aquí tu objeto PianoSSR.
-piano_hardware = None
+
+RELEVADOR_POR_NOTA = {
+    "DO": 8,
+    "RE": 7,
+    "MI": 6,
+    "FA": 5,
+    "SOL": 4,
+    "LA": 3,
+    "SI": 2,
+    "FA#": 1
+}
+
+NOTAS_DEL_PIANO = sorted(
+    RELEVADOR_POR_NOTA,
+    key=lambda nota: RELEVADOR_POR_NOTA[nota]
+)
 
 
 class MotorDeNotas:
     """
-    Reproduce notas sueltas y acordes.
+    Reproduce una nota sola o varias a la vez.
 
     Busca un motor de sonido disponible en este orden:
       1. pygame   (Windows, Linux y Raspberry Pi)
@@ -567,7 +1238,7 @@ class MotorDeNotas:
         except Exception:
             pass
 
-        print("TALAT: sin motor de sonido. Instala pygame para escuchar los acordes.")
+        print("TALAT: sin motor de sonido. Instala pygame para escuchar las notas.")
 
     def disponible(self):
         return self.backend != "silencio"
@@ -619,8 +1290,6 @@ class MotorDeNotas:
                         sonido.play()
 
             elif self.backend == "winsound":
-                # winsound no puede sonar dos notas a la vez.
-                # Las tocamos muy rápido, como un arpegio.
                 for nota in notas:
                     frecuencia = FRECUENCIAS_NOTAS.get(nota)
                     if frecuencia:
@@ -629,39 +1298,52 @@ class MotorDeNotas:
         except Exception as e:
             print("No se pudo reproducir el sonido:", e)
 
-    def enviar_a_hardware(self, notas):
+    def enviar_a_hardware(self, notas, duracion_ms=None):
         """
-        Punto de conexión con los relevadores SSR del piano.
+        Manda las notas al piano físico.
 
-        Recibe la lista de notas del acorde. Cuando tengas listo el
-        módulo HARWARE, basta con:  piano_hardware = PianoSSR()
+        Van todas en un solo mensaje: si se enviaran una por una, las
+        tres notas de un acorde llegarían separadas por milisegundos
+        y se oiría como un arpegio rápido en vez de un acorde.
+
+        La duración viaja con ellas: así una corchea le pide al piano
+        media tecla de tiempo y una blanca el doble.
         """
-        if piano_hardware is None:
+        if piano_hardware is None or not piano_hardware.disponible():
             return
 
         try:
-            for nota in notas:
-                piano_hardware.tocar(nota)
+            if duracion_ms:
+                piano_hardware.tocar(notas, duracion_ms)
+            else:
+                piano_hardware.tocar(notas)
+
         except Exception as e:
             print("No se pudo activar el relevador:", e)
 
-    def tocar(self, nota):
-        """Una sola nota (lo que usa el Modo Terapia)."""
+    def precargar(self, notas):
+        """
+        Genera de una vez todos los sonidos.
+
+        Crear una nota cuesta ~19,000 cuentas en Python. Si eso pasa
+        mientras la melodía suena, la primera nota de cada frase llega
+        tarde y se oye un tirón.
+        """
+        if self.backend != "pygame":
+            return
+
+        for nota in notas:
+            if nota not in self.cache:
+                self.cache[nota] = self._crear_sonido(nota)
+
+    def tocar(self, nota, duracion_ms=None):
+        """Una sola nota."""
         if nota in ("--", None):
             return
 
-        self.tocar_notas([nota])
+        self.tocar_notas([nota], duracion_ms)
 
-    def tocar_acorde(self, clave_acorde):
-        """Un acorde completo, por su clave: DO, FA, SOL7..."""
-        acorde = ACORDES.get(clave_acorde)
-
-        if acorde is None:
-            return
-
-        self.tocar_notas(acorde["notas"])
-
-    def tocar_notas(self, notas):
+    def tocar_notas(self, notas, duracion_ms=None):
         """Suena una o varias notas a la vez, sin congelar la interfaz."""
         threading.Thread(
             target=self._reproducir_notas,
@@ -669,52 +1351,313 @@ class MotorDeNotas:
             daemon=True
         ).start()
 
-        self.enviar_a_hardware(notas)
+        self.enviar_a_hardware(notas, duracion_ms)
 
 
 motor_notas = MotorDeNotas()
 
+# En segundo plano, para que la ventana abra igual de rápido.
+threading.Thread(
+    target=lambda: motor_notas.precargar(list(FRECUENCIAS_NOTAS)),
+    daemon=True
+).start()
+
 
 # ==========================================
-# ACORDES Y GESTOS
+# PIANO FÍSICO (ARDUINO UNO + RELEVADORES)
 # ==========================================
-#
-# Cada gesto produce un ACORDE completo, no una nota suelta.
-# Así se tocan canciones de verdad con muy pocos gestos.
 
-ACORDES = {
-    "DO": {
+# Todo está envuelto en try: si no hay Arduino conectado, si falta la
+
+#       PUERTO_ARDUINO = "COM5"          en Windows
+#       PUERTO_ARDUINO = "/dev/ttyUSB0"  en Linux / Raspberry
+
+PUERTO_ARDUINO = None      # None = buscarlo solo
+
+DEPURAR_PIANO = True
+VELOCIDAD_ARDUINO = 115200
+DURACION_TECLA_MS = 600
+
+PISTAS_ARDUINO = ("arduino", "ch340", "ch341", "cp210", "usb serial", "wch")
+
+
+class PianoArduino:
+    """Puente entre TALAT y los relevadores del piano."""
+
+    def __init__(self):
+        self.puerto = None
+        self.conexion = None
+        self.error = ""
+
+    def disponible(self):
+        return self.conexion is not None
+
+    # ---------- conexión ----------
+
+    def buscar_puerto(self):
+        try:
+            from serial.tools import list_ports
+        except ImportError:
+            self.error = "Falta pyserial (pip install pyserial)"
+            return None
+
+        candidatos = list(list_ports.comports())
+
+        for puerto in candidatos:
+            descripcion = f"{puerto.description} {puerto.manufacturer}".lower()
+
+            if any(pista in descripcion for pista in PISTAS_ARDUINO):
+                return puerto.device
+
+        # Si solo hay un puerto, probablemente es ese.
+        if len(candidatos) == 1:
+            return candidatos[0].device
+
+        if candidatos:
+            nombres = ", ".join(p.device for p in candidatos)
+            self.error = f"Ningún puerto parece Arduino ({nombres})"
+        else:
+            self.error = "No hay puertos: revisa el cable USB"
+
+        return None
+
+    def conectar(self):
+        """
+        Abre el puerto. Tarda unos segundos, así que se llama desde un
+        hilo aparte para que la ventana de TALAT no se congele.
+        """
+        try:
+            import serial
+        except ImportError:
+            self.error = "Falta pyserial (pip install pyserial)"
+            return False
+
+        if PUERTO_ARDUINO:
+            return self._abrir(PUERTO_ARDUINO)
+
+        preferido = self.buscar_puerto()
+
+        if preferido and self._abrir(preferido):
+            return True
+
+        try:
+            from serial.tools import list_ports
+            candidatos = [p.device for p in list_ports.comports()]
+        except Exception:
+            candidatos = []
+
+        for puerto in candidatos:
+            if puerto == preferido:
+                continue
+
+            if DEPURAR_PIANO:
+                print(f"Probando {puerto}...")
+
+            if self._abrir(puerto):
+                return True
+
+        if not self.error:
+            self.error = "No respondió ningún puerto"
+
+        return False
+
+    def _abrir(self, puerto):
+        """Abre un puerto y revisa si del otro lado está nuestro sketch."""
+        import serial
+        import time
+
+        try:
+            conexion = serial.Serial(
+                puerto,
+                VELOCIDAD_ARDUINO,
+                timeout=0.2,
+                write_timeout=0.5
+            )
+
+        except Exception as e:
+            if DEPURAR_PIANO:
+                print(f"  {puerto}: {e}")
+
+            self.error = str(e)
+            return False
+
+        # Al abrir el puerto el Arduino se reinicia solo.
+        # Si le hablamos antes de tiempo, pierde el primer mensaje.
+        time.sleep(2.0)
+
+        saludo = conexion.read_all().decode(errors="ignore")
+
+        if DEPURAR_PIANO:
+            print(f"  {puerto} saludó: {saludo.strip()!r}")
+
+        self.conexion = conexion
+        self.puerto = puerto
+
+        if "TALAT" not in saludo:
+            self.error = "Conectado, pero no saludó (¿sketch viejo?)"
+        else:
+            self.error = ""
+
+        return True
+
+    def soltar_todo(self):
+        """Abre todos los relevadores. Paro de emergencia."""
+        if self.conexion is None:
+            return
+
+        try:
+            self.conexion.write(b"X\n")
+        except Exception:
+            pass
+
+    def cerrar(self):
+        if self.conexion is None:
+            return
+
+        try:
+            self.conexion.write(b"X\n")
+            self.conexion.close()
+        except Exception:
+            pass
+
+        self.conexion = None
+
+    # ---------- tocar ----------
+
+    def tocar(self, notas, duracion_ms=DURACION_TECLA_MS):
+        """Cierra los relevadores de esas notas."""
+        if self.conexion is None:
+            return
+
+        relevadores = [
+            str(RELEVADOR_POR_NOTA[nota])
+            for nota in notas
+            if nota in RELEVADOR_POR_NOTA
+        ]
+
+        if not relevadores:
+            return
+
+        mensaje = f"T:{','.join(relevadores)}:{int(duracion_ms)}\n"
+
+        try:
+            self.conexion.write(mensaje.encode("ascii"))
+
+            self.conexion.flush()
+
+            if DEPURAR_PIANO:
+                print("-> Arduino:", mensaje.strip())
+
+            if self.conexion.in_waiting:
+                respuesta = self.conexion.read_all()
+
+                if DEPURAR_PIANO:
+                    print("<- Arduino:", respuesta.decode(errors="ignore").strip())
+
+        except Exception as e:
+            print("Se perdió el Arduino:", e)
+            self.conexion = None
+            self.error = "Se desconectó"
+
+
+    def probar(self):
+        """
+        Recorre las doce teclas, una por una.
+
+        Sirve para revisar el cableado sin tener que hacer caras
+        frente a la cámara: si el relevador 5 no suena, ese es el
+        cable flojo.
+        """
+        if self.conexion is None:
+            return
+
+        import time
+
+        for nota in NOTAS_DEL_PIANO:
+            self.tocar([nota], 300)
+            time.sleep(0.4)
+
+
+piano_hardware = PianoArduino()
+
+
+def conectar_piano():
+    """Busca el Arduino en segundo plano y avisa en pantalla."""
+    piano_hardware.conectar()
+
+    def avisar():
+        if "estado_piano" not in globals():
+            return
+
+        if piano_hardware.disponible():
+            if piano_hardware.error:
+                # Abrió el puerto pero el sketch no contestó bien.
+                estado_piano.configure(
+                    text=f"⚠ {piano_hardware.error}",
+                    text_color=NARANJA
+                )
+            else:
+                estado_piano.configure(
+                    text=f"🎹 Piano conectado ({piano_hardware.puerto})",
+                    text_color=VERDE
+                )
+        else:
+
+            motivo = piano_hardware.error or "sin piano"
+
+            estado_piano.configure(
+                text=f"🔌 {motivo}",
+                text_color=NARANJA
+            )
+
+        registrar_evento(
+            "Equipo",
+            piano_hardware.error or f"Piano conectado en {piano_hardware.puerto}",
+            "-"
+        )
+
+        if DEPURAR_PIANO:
+            print("Piano:", piano_hardware.error or "conectado en " + str(piano_hardware.puerto))
+
+    app.after(0, avisar)
+
+
+threading.Thread(target=conectar_piano, daemon=True).start()
+
+
+# ==========================================
+# ACORDES Y NOTAS POR GESTOS
+# ==========================================
+
+ACORDES_TERAPIA = {
+    "ABURRIMIENTO": {
         "nombre": "DO mayor",
-        "grado": "I",
-        "notas": ["DO", "MI", "SOL"],
-        "color": "#FFD93D"
+        "notas": ["DO", "MI", "SOL"]
     },
-    "FA": {
+    "SORPRESA": {
+        "nombre": "RE menor",
+        "notas": ["RE", "FA", "LA"]
+    },
+    "IRA": {
+        "nombre": "MI menor",
+        "notas": ["MI", "SOL", "SI"]
+    },
+    "TRISTEZA": {
         "nombre": "FA mayor",
-        "grado": "IV",
-        "notas": ["FA", "LA", "DO5"],
-        "color": "#FF4444"
+        "notas": ["FA", "LA", "DO"]
     },
-    "SOL7": {
-        "nombre": "SOL séptima",
-        "grado": "V7",
-        "notas": ["SOL", "SI", "RE5", "FA5"],
-        "color": AZUL
+    "ALEGRÍA": {
+        "nombre": "SOL mayor",
+        "notas": ["SOL", "SI", "RE"]
     }
 }
 
-# Qué cara hay que poner para cada acorde.
-# Elegimos las tres expresiones MÁS distintas entre sí, para que el
-# detector no las confunda. TRISTEZA y ABURRIMIENTO quedan libres
-# para cuando agreguemos acordes menores (LAm, REm).
-GESTO_POR_ACORDE = {
-    "DO": "ALEGRÍA",
-    "SOL7": "SORPRESA",
-    "FA": "IRA"
-}
-
-ACORDE_POR_GESTO = {
-    gesto: acorde for acorde, gesto in GESTO_POR_ACORDE.items()
+NOTAS_POR_EMOCION = {
+    "ABURRIMIENTO": "DO",
+    "SORPRESA": "RE",
+    "IRA": "MI",
+    "TRISTEZA": "FA",
+    "ALEGRÍA": "SOL"
 }
 
 GUIA_DE_GESTOS = {
@@ -747,26 +1690,51 @@ GUIA_DE_GESTOS = {
 
 
 # ==========================================
-# CANCIONES GUIADAS#
+# CANCIONES GUIADAS
 # ==========================================
+
+# ------------------------------------------
+# EL RITMO
+# ------------------------------------------
+
+ARTICULACION = 0.85
+
+# Por si alguna canción no trae pulso propio.
+PULSO_MELODIA = 0.45
+
+# Color de la etiqueta que aparece en el menú de canciones.
+COLOR_DIFICULTAD = {
+    "Fácil": VERDE,
+    "Media": AMARILLO,
+    "Larga": NARANJA
+}
 
 CANCIONES = {
     "cucaracha": {
         "titulo": "La cucaracha",
-        "subtitulo": "2 gestos · canción fácil",
+        "subtitulo": "2 frases · 2 expresiones",
         "dificultad": "Fácil",
-        "bloques": [
+        "pulso": 0.42,
+        "frases": [
             {
                 "letra": (
                     "La cucaracha, la cucaracha\n"
                     "ya no puede caminar"
                 ),
                 "gesto": "ALEGRÍA",
-                "acordes": [
-                    "DO",
-                    "DO",
-                    "SOL7",
-                    "DO"
+                "notas": [
+                    # "La cu-ca-" van rápidas y "ra-cha" se asienta.
+                    ("RE", 0.5), ("RE", 0.5), ("RE", 0.5),
+                    ("SOL", 1.0), ("SI", 1.0),
+
+                    ("RE", 0.5), ("RE", 0.5), ("RE", 0.5),
+                    ("SOL", 1.0), ("SI", 1.0),
+
+                    # "ya no pue-de ca-mi-" corridas y "nar" larga.
+                    ("SOL", 0.5), ("SOL", 0.5),
+                    ("FA#", 0.5), ("FA#", 0.5),
+                    ("MI", 0.5), ("MI", 0.5),
+                    ("RE", 2.0)
                 ]
             },
             {
@@ -775,78 +1743,44 @@ CANCIONES = {
                     "las dos patitas de atrás"
                 ),
                 "gesto": "SORPRESA",
-                "acordes": [
-                    "SOL7",
-                    "SOL7",
-                    "SOL7",
-                    "DO"
+                "notas": [
+                    ("RE", 0.5), ("RE", 0.5), ("RE", 0.5),
+                    ("FA#", 1.0), ("LA", 1.0),
+
+                    ("RE", 0.5), ("RE", 0.5), ("RE", 0.5),
+                    ("FA#", 1.0), ("LA", 1.0),
+
+                    ("RE", 0.5), ("MI", 0.5), ("RE", 0.5),
+                    ("DO", 0.5), ("SI", 0.5), ("LA", 0.5),
+                    ("SOL", 2.0)
                 ]
             }
         ]
     },
 
-    "estrellita_corta": {
+    "estrellita": {
         "titulo": "Estrellita, ¿dónde estás?",
-        "subtitulo": "2 gestos · versión corta",
+        "subtitulo": "3 frases · 3 expresiones",
         "dificultad": "Media",
-        "bloques": [
+        # Más lenta que La cucaracha: es una canción de cuna.
+        "pulso": 0.55,
+        "frases": [
             {
                 "letra": (
                     "Estrellita, ¿dónde estás?\n"
                     "Me pregunto quién serás"
                 ),
                 "gesto": "ALEGRÍA",
-                "acordes": [
-                    "DO",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7",
-                    "DO"
-                ]
-            },
-            {
-                "letra": (
-                    "En el cielo o en el mar\n"
-                    "un diamante de verdad"
-                ),
-                "gesto": "SORPRESA",
-                "acordes": [
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7"
-                ]
-            }
-        ]
-    },
+                "notas": [
+                    ("SOL", 1.0), ("SOL", 1.0),
+                    ("RE", 1.0), ("RE", 1.0),
+                    ("MI", 1.0), ("MI", 1.0),
+                    ("RE", 2.0),
 
-    "estrellita_completa": {
-        "titulo": "Estrellita, ¿dónde estás?",
-        "subtitulo": "3 gestos · canción completa",
-        "dificultad": "Larga",
-        "bloques": [
-            {
-                "letra": (
-                    "Estrellita, ¿dónde estás?\n"
-                    "Me pregunto quién serás"
-                ),
-                "gesto": "ALEGRÍA",
-                "acordes": [
-                    "DO",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7",
-                    "DO"
+                    ("DO", 1.0), ("DO", 1.0),
+                    ("SI", 1.0), ("SI", 1.0),
+                    ("LA", 1.0), ("LA", 1.0),
+                    ("SOL", 2.0)
                 ]
             },
             {
@@ -855,15 +1789,16 @@ CANCIONES = {
                     "un diamante de verdad"
                 ),
                 "gesto": "SORPRESA",
-                "acordes": [
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7"
+                "notas": [
+                    ("RE", 1.0), ("RE", 1.0),
+                    ("DO", 1.0), ("DO", 1.0),
+                    ("SI", 1.0), ("SI", 1.0),
+                    ("LA", 2.0),
+
+                    ("RE", 1.0), ("RE", 1.0),
+                    ("DO", 1.0), ("DO", 1.0),
+                    ("SI", 1.0), ("SI", 1.0),
+                    ("LA", 2.0)
                 ]
             },
             {
@@ -872,15 +1807,16 @@ CANCIONES = {
                     "Me pregunto quién serás"
                 ),
                 "gesto": "ALEGRÍA",
-                "acordes": [
-                    "DO",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "FA",
-                    "DO",
-                    "SOL7",
-                    "DO"
+                "notas": [
+                    ("SOL", 1.0), ("SOL", 1.0),
+                    ("RE", 1.0), ("RE", 1.0),
+                    ("MI", 1.0), ("MI", 1.0),
+                    ("RE", 2.0),
+
+                    ("DO", 1.0), ("DO", 1.0),
+                    ("SI", 1.0), ("SI", 1.0),
+                    ("LA", 1.0), ("LA", 1.0),
+                    ("SOL", 2.0)
                 ]
             }
         ]
@@ -888,28 +1824,46 @@ CANCIONES = {
 }
 
 
+def partes_de_nota(nota):
+    """
+    Devuelve (nombre, figura).
+
+    Acepta las dos formas: ("RE", 0.5) con su figura, o "RE" a secas
+    para no romper las canciones escritas antes del ritmo.
+    """
+    if isinstance(nota, (tuple, list)):
+        return nota[0], float(nota[1])
+
+    return nota, 1.0
+
+
+def nombres_de_notas(notas):
+    """Solo los nombres, que es lo que se ve en pantalla."""
+    return [partes_de_nota(n)[0] for n in notas]
+
+
 def gestos_usados(cancion):
     return [
-        bloque["gesto"]
-        for bloque in cancion["bloques"]
+        frase["gesto"]
+        for frase in cancion["frases"]
     ]
 
 class CancionGuiada:
     """
     Canción Guiada:
 
-    UN GESTO = UN BLOQUE MUSICAL COMPLETO.
+    UNA EXPRESIÓN = UNA FRASE COMPLETA DE LA MELODÍA.
 
-    La persona hace una expresión una sola vez.
-    TALAT reproduce automáticamente todos los acordes
-    del bloque y la persona puede relajar la cara mientras suena.
+    La persona hace la expresión una sola vez.
+    TALAT toca las notas de esa frase, una tras otra, y la persona
+    puede relajar la cara mientras suena.
     """
 
     def __init__(self, motor):
         self.motor = motor
         self.clave = None
         self.cancion = None
-        self.bloques = []
+        self.frases = []
         self.indice = 0
 
         self.estado = "detenida"
@@ -928,44 +1882,52 @@ class CancionGuiada:
     def cargada(self):
         return self.cancion is not None
 
-    def total_bloques(self):
-        return len(self.bloques)
+    def total_frases(self):
+        return len(self.frases)
 
-    def bloque_actual(self):
-        if not self.bloques or self.indice >= len(self.bloques):
+    def frase_actual(self):
+        if not self.frases or self.indice >= len(self.frases):
             return None
 
-        return self.bloques[self.indice]
+        return self.frases[self.indice]
 
     def gesto_actual(self):
-        bloque = self.bloque_actual()
+        frase = self.frase_actual()
 
-        if bloque is None:
+        if frase is None:
             return None
 
-        return bloque.get("gesto")
+        return frase.get("gesto")
 
     def letra_actual(self):
-        bloque = self.bloque_actual()
+        frase = self.frase_actual()
 
-        if bloque is None:
+        if frase is None:
             return ""
 
-        return bloque.get("letra", "")
+        return frase.get("letra", "")
 
-    def acordes_actuales(self):
-        bloque = self.bloque_actual()
+    def notas_actuales(self):
+        """Los nombres de las notas, para dibujarlas en pantalla."""
+        frase = self.frase_actual()
 
-        if bloque is None:
+        if frase is None:
             return []
 
-        return bloque.get("acordes", [])
+        return nombres_de_notas(frase.get("notas", []))
+
+    def pulso(self):
+        """Cuánto dura una negra en esta canción, en segundos."""
+        if self.cancion is None:
+            return PULSO_MELODIA
+
+        return float(self.cancion.get("pulso", PULSO_MELODIA))
 
     def progreso(self):
-        if not self.bloques:
+        if not self.frases:
             return 0.0
 
-        return self.indice / len(self.bloques)
+        return self.indice / len(self.frases)
 
     # --------------------------------------
     # CARGAR
@@ -979,7 +1941,7 @@ class CancionGuiada:
 
         self.clave = clave
         self.cancion = cancion
-        self.bloques = list(cancion.get("bloques", []))
+        self.frases = list(cancion.get("frases", []))
 
         self.indice = 0
         self.aciertos = 0
@@ -1037,17 +1999,14 @@ class CancionGuiada:
 
     def procesar(self, gesto):
         """
-        Un solo gesto correcto inicia un bloque completo.
+        Una sola expresión correcta dispara la frase completa.
         """
 
         self.gesto_detectado = gesto
 
+        # Mientras la frase suena, el estado es "reproduciendo"
+        # y aquí no se acepta ninguna expresión nueva.
         if self.estado != "tocando":
-            return False
-
-        # Mientras un bloque está sonando no aceptamos
-        # otro gesto.
-        if self.estado == "reproduciendo":
             return False
 
         # Primero necesitamos volver a reposo.
@@ -1066,116 +2025,108 @@ class CancionGuiada:
         if gesto != objetivo:
             return False
 
-        return self._acertar_bloque()
+        return self._acertar_frase()
 
     # --------------------------------------
     # EJECUTAR BLOQUE
     # --------------------------------------
 
-    def _acertar_bloque(self):
-        bloque = self.bloque_actual()
+    def _acertar_frase(self):
+        frase = self.frase_actual()
 
-        if bloque is None:
+        if frase is None:
             return False
 
-        acordes = bloque.get("acordes", [])
+        notas = frase.get("notas", [])
 
-        if not acordes:
+        if not notas:
             return False
 
         self.estado = "reproduciendo"
         self.aciertos += 1
 
-        # Guardamos el bloque actual antes de avanzar.
-        indice_bloque = self.indice
+        # Guardamos en qué frase vamos antes de avanzar.
+        indice_frase = self.indice
 
-        # Reproduce el bloque completo.
+        # Reproduce la frase completa, con el pulso de esta canción.
         threading.Thread(
-            target=self._reproducir_bloque,
-            args=(acordes, indice_bloque),
+            target=self._reproducir_frase,
+            args=(notas, indice_frase, self.pulso()),
             daemon=True
         ).start()
 
         return True
 
-    def _reproducir_bloque(self, acordes, indice_bloque):
-        try:
-            for acorde in acordes:
+    def _reproducir_frase(self, notas, indice_frase, pulso):
+        import time
 
-                if self.estado == "pausada":
+        try:
+            for posicion, nota in enumerate(notas):
+
+                # Si se pausó o se salió de la canción, el hilo muere.
+                # Antes solo revisaba "pausada" y seguía sonando aunque
+                # el usuario ya se hubiera ido al menú.
+                if self.estado != "reproduciendo":
                     return
 
-                self.motor.tocar_acorde(acorde)
+                nombre, figura = partes_de_nota(nota)
 
-                # Tiempo entre acordes para que se escuche
-                # como una pequeña progresión musical.
-                import time
-                time.sleep(0.75)
+                # Lo que dura la nota en el compás.
+                largo = figura * pulso
+
+                # Lo que se queda pisada la tecla: un poco menos, para
+                # que se oiga el corte entre una nota y la siguiente.
+                self.motor.tocar(
+                    nombre,
+                    duracion_ms=int(largo * ARTICULACION * 1000)
+                )
+
+                # La interfaz solo se puede tocar desde el hilo principal.
+                app.after(
+                    0,
+                    lambda p=posicion, i=indice_frase: resaltar_nota(i, p)
+                )
+
+                time.sleep(largo)
 
             # Solo la interfaz principal debe modificar
             # el estado de la canción.
             app.after(
                 100,
-                lambda i=indice_bloque: self._terminar_bloque(i)
+                lambda i=indice_frase: self._terminar_frase(i)
             )
 
         except Exception as e:
-            print("Error reproduciendo bloque:", e)
+            print("Error reproduciendo la frase:", e)
 
             app.after(
                 100,
-                lambda i=indice_bloque: self._terminar_bloque(i)
+                lambda i=indice_frase: self._terminar_frase(i)
             )
 
-    def _terminar_bloque(self, indice_bloque):
+    def _terminar_frase(self, indice_frase):
         # Evita avanzar accidentalmente si ya cambió la canción.
-        if indice_bloque != self.indice:
+        if indice_frase != self.indice:
             return
 
         self.indice += 1
 
-        if self.indice >= len(self.bloques):
+        if self.indice >= len(self.frases):
             self.estado = "terminada"
             self.esperando_reposo = False
 
         else:
             self.estado = "tocando"
 
-            # Para activar el siguiente bloque:
+            # Para activar la siguiente frase:
             # primero debe relajar la cara.
             self.esperando_reposo = True
 
         actualizar_panel_cancion()
 
-    # --------------------------------------
-    # ESTADO DEL BLOQUE
-    # --------------------------------------
-
-    def bloque_reproduciendose(self):
-        return self.estado == "reproduciendo"
-
 # ==========================================
 # MODO LIBRE
 # ==========================================
-#
-# La persona graba SU propio gesto para cada sonido.
-# No hay gestos predefinidos: puede usar la boca, los ojos, las cejas
-# o cualquier combinación que le resulte cómoda.
-#
-# Dos decisiones importantes de precisión:
-#
-#  1. Distancia NORMALIZADA. Las mediciones no son comparables entre sí:
-#     la boca se mueve 0.060 y una ceja apenas 0.013. Sumando diferencias
-#     crudas, la boca aplasta a todo lo demás y los gestos de ojos y cejas
-#     nunca se reconocen. Dividimos cada medición entre su recorrido
-#     típico para que todas pesen igual.
-#
-#  2. PROMEDIO de varias lecturas. El temblor de los puntos de MediaPipe
-#     es del mismo tamaño que el movimiento de una ceja. Promediando las
-#     últimas lecturas ese temblor se reduce a la tercera parte.
-#
-#  Midiendo las dos juntas: el acierto sube de 79% a 99%, y los disparos
-#  con la cara quieta bajan a cero.
 
 CLAVES_MODO_LIBRE = [
     "apertura_boca",
@@ -1207,42 +2158,23 @@ NOMBRES_MOVIMIENTO = {
     "cercania_cejas": ("cejas separadas", "ceño fruncido")
 }
 
-# Lecturas que se promedian antes de decidir qué gesto es.
 LECTURAS_SUAVIZADO = 8
 
-# Un gesto por debajo de esto no se distingue del temblor de la cámara.
-# Un movimiento completo vale 1.00 en su propio eje; el ruido, ya
-# promediado sobre las 20 lecturas de la grabación, vale unos 0.21.
 MOVIMIENTO_MINIMO_LIBRE = 0.60
 
-# Qué tan distintos deben ser dos gestos para poder usarse en sonidos
-# diferentes. Por debajo de 0.80 la confusión al tocar sube muchísimo.
 DIFERENCIA_MINIMA_GESTOS = 0.80
 
-# El gesto debe ganarle claramente al rostro relajado para que suene.
 MARGEN_REPOSO_LIBRE = 0.70
 
 TOTAL_MUESTRAS_MOVIMIENTO_LIBRE = 20
 SEGUNDOS_CUENTA_REGRESIVA = 3
 
-# Sonidos que se pueden asignar: notas sueltas y acordes.
+
 SONIDOS_LIBRES = {
-    "DO": {"etiqueta": "🎵 DO", "notas": ["DO"]},
-    "RE": {"etiqueta": "🎵 RE", "notas": ["RE"]},
-    "MI": {"etiqueta": "🎵 MI", "notas": ["MI"]},
-    "FA": {"etiqueta": "🎵 FA", "notas": ["FA"]},
-    "SOL": {"etiqueta": "🎵 SOL", "notas": ["SOL"]},
-    "LA": {"etiqueta": "🎵 LA", "notas": ["LA"]},
-    "SI": {"etiqueta": "🎵 SI", "notas": ["SI"]},
-    "DO5": {"etiqueta": "🎵 DO alto", "notas": ["DO5"]},
-    "RE5": {"etiqueta": "🎵 RE alto", "notas": ["RE5"]},
-    "MI5": {"etiqueta": "🎵 MI alto", "notas": ["MI5"]},
-    "AC_DO": {"etiqueta": "🎹 Acorde DO", "notas": ["DO", "MI", "SOL"]},
-    "AC_FA": {"etiqueta": "🎹 Acorde FA", "notas": ["FA", "LA", "DO5"]},
-    "AC_SOL7": {"etiqueta": "🎹 Acorde SOL7", "notas": ["SOL", "SI", "RE5", "FA5"]}
+    nota: {"etiqueta": f"🎵 {nota}", "notas": [nota]}
+    for nota in NOTAS
 }
 
-ETIQUETA_A_SONIDO = {d["etiqueta"]: c for c, d in SONIDOS_LIBRES.items()}
 SONIDO_A_ETIQUETA = {c: d["etiqueta"] for c, d in SONIDOS_LIBRES.items()}
 
 
@@ -1334,8 +2266,8 @@ class InstrumentoLibre:
     """
 
     def __init__(self):
-        self.ranuras = []          # [{"sonido": "DO", "gesto": {...}, "texto": "..."}]
-        self.historial = []        # últimas lecturas, para promediar
+        self.ranuras = []
+        self.historial = []
         self.ultimo_sonando = None
 
     # ---------- edición ----------
@@ -1495,6 +2427,44 @@ cuenta_regresiva_libre = 0
 
 
 
+# Modo Terapia: "notas" (una nota por expresión) o "acordes".
+sonido_terapia = "notas"
+
+
+def sonar_expresion(emocion):
+    """
+    Suena la expresión que acaba de hacer la persona.
+
+    Se llama UNA sola vez, en el momento en que la expresión se vuelve
+    estable, no en cada frame: si no, la misma cara dispararía la nota
+    treinta veces por segundo.
+    """
+    if sonido_terapia == "acordes":
+        acorde = ACORDES_TERAPIA.get(emocion)
+
+        if acorde is None:
+            return ""
+
+        motor_notas.tocar_notas(acorde["notas"])
+
+        return acorde["nombre"]
+
+    nota = NOTAS_POR_EMOCION.get(emocion)
+
+    if nota is None:
+        return ""
+
+    motor_notas.tocar(nota)
+
+    return nota
+
+
+def cambiar_sonido_terapia(valor):
+    global sonido_terapia
+
+    sonido_terapia = "acordes" if valor.startswith("🎹") else "notas"
+
+
 cancion_guiada = CancionGuiada(motor_notas)
 
 # Modo de la sesión: "terapia" o "cancion".
@@ -1541,6 +2511,8 @@ def iniciar_camara():
     ultima_expresion_registrada = "REPOSO"
     registros_expresiones_sesion = []
     contador_frames = 0
+
+    registrar_evento("Inicio de sesión", "Comienza la calibración del rostro")
 
     # La calibración solo sirve para ESTA sesión.
     # No se guarda en usuarios.json.
@@ -1607,6 +2579,13 @@ def guardar_sesion():
 
     guardar_usuarios(usuarios_db)
 
+    registrar_evento(
+        "Fin de sesión",
+        "Sesión de trabajo completa",
+        duracion_min=str(round(duracion / 60, 1)),
+        expresiones=str(estadisticas_sesion["expresiones"])
+    )
+
     if "actualizar_estadisticas_perfil" in globals():
         actualizar_estadisticas_perfil()
 
@@ -1622,6 +2601,11 @@ def detener_camara():
 
     if not camara_activa and camara is None:
         return
+
+    # Abrir todos los relevadores: ninguna tecla se queda pisada
+    # si la sesión termina justo mientras sonaba un acorde.
+    if piano_hardware is not None and piano_hardware.disponible():
+        piano_hardware.soltar_todo()
 
     guardar_sesion()
 
@@ -1698,7 +2682,7 @@ def actualizar_camara():
                 emoji_label.configure(text="😐")
 
                 estado_expresion.configure(
-                    text="CALIBRANDO",
+                    text=traducir("CALIBRANDO"),
                     text_color=AZUL
                 )
 
@@ -1708,12 +2692,12 @@ def actualizar_camara():
                 )
 
                 mensaje_label.configure(
-                    text="Mantén tu rostro relajado",
+                    text=traducir("Mantén tu rostro relajado"),
                     text_color=AZUL
                 )
 
                 instruccion_label.configure(
-                    text="INSTRUCCIÓN: No sonrías ni hagas gestos. Mira al frente y mantén el rostro relajado."
+                    text=traducir("INSTRUCCIÓN: No sonrías ni hagas gestos. Mira al frente y mantén el rostro relajado.")
                 )
 
             elif detector.calibrado:
@@ -1721,7 +2705,7 @@ def actualizar_camara():
                 emoji_label.configure(text=detector.emoji)
 
                 estado_expresion.configure(
-                    text=detector.emocion,
+                    text=traducir(detector.emocion),
                     text_color=detector.color
                 )
 
@@ -1731,13 +2715,13 @@ def actualizar_camara():
                 )
 
                 mensaje_label.configure(
-                    text=detector.mensaje,
+                    text=traducir(detector.mensaje),
                     text_color=detector.color
                 )
 
                 if detector.emocion == "REPOSO":
                     instruccion_label.configure(
-                        text="INSTRUCCIÓN: Haz una expresión clara y mantenla unos instantes."
+                        text=traducir("INSTRUCCIÓN: Haz una expresión clara y mantenla unos instantes.")
                     )
                 else:
                     instruccion_label.configure(text="")
@@ -1794,6 +2778,28 @@ def actualizar_camara():
                     if detector.nota != "--":
                         estadisticas_sesion["notas"] += 1
 
+                    registrar_evento(
+                        "Expresión lograda",
+                        f"La persona sostuvo la expresión de "
+                        f"{detector.ultima_estable.lower()}",
+                        expresion=detector.ultima_estable.capitalize(),
+                        intensidad=intensidad_en_palabras(
+                            detector.ultima_estable, medicion
+                        ),
+                        comparacion=comparacion
+                    )
+
+                    # En Modo Terapia la expresión suena aquí mismo.
+                    # Los otros dos modos tienen su propio disparador.
+                    if modo_sesion == "terapia":
+                        sonando = sonar_expresion(detector.ultima_estable)
+
+                        if sonando:
+                            estado_nota.configure(
+                                text=f"🎹 {sonando}",
+                                text_color=detector.color
+                            )
+
                     ultima_expresion_registrada = detector.ultima_estable
 
                 elif detector.ultima_estable == "REPOSO":
@@ -1808,17 +2814,23 @@ def actualizar_camara():
                 # El modo libre de arriba queda intacto: esto solo se activa
                 # cuando el usuario eligió "Canción Guiada".
                 if modo_sesion == "cancion":
-                    avanzo = cancion_guiada.procesar(detector.ultima_estable)
+                    # Sin este try, cualquier error del panel corta el
+                    # app.after de abajo y la cámara se queda congelada.
+                    try:
+                        avanzo = cancion_guiada.procesar(detector.ultima_estable)
 
-                    if "actualizar_panel_cancion" in globals():
                         if avanzo:
                             actualizar_panel_cancion()
                         else:
                             refrescar_deteccion_cancion()
 
-    # Mostrar la imagen reducida; 640x480 es mucho más ligero que 1000x750.
+                    except Exception as e:
+                        print("Error en Canción Guiada:", e)
+
+    # Reescalar cuesta CPU 30 veces por segundo: BILINEAR es la
+    # interpolación más barata que se ve bien.
     imagen = Image.fromarray(rgb)
-    imagen = imagen.resize((1000, 750))
+    imagen = imagen.resize((930, 650), Image.BILINEAR)
 
     foto = ImageTk.PhotoImage(imagen)
 
@@ -1849,11 +2861,6 @@ def mostrar_inicio():
 
     if not inicio_frame.winfo_ismapped():
         inicio_frame.pack(fill="both", expand=True)
-
-def mostrar_perfil():
-    bienvenido_frame.pack_forget()
-    inicio_frame.pack_forget()
-    perfil_frame.pack(fill="both", expand=True)
 
 def iniciar_sesion():
     perfil_frame.pack_forget()
@@ -2014,24 +3021,12 @@ except Exception as e:
 
 slogan = ctk.CTkLabel(
     left_frame,
-    text="La música al alcance de todos",
+    text=traducir("La música al alcance de todos"),
     font=("Montserrat",22),
     text_color=GRIS
 )
 
 slogan.pack()
-
-instruccion_bienvenida = ctk.CTkLabel(
-    left_frame,
-    text="Primero crea o selecciona un usuario.\nDespués inicia una sesión y mantén tu rostro relajado durante la calibración.",
-    font=("Montserrat",16),
-    text_color=GRIS,
-    justify="center"
-)
-
-instruccion_bienvenida.pack(
-    pady=(15,0)
-)
 
 # ==========================================
 # ZONA DERECHA (BOTONES)
@@ -2053,7 +3048,7 @@ right_frame.pack(
 
 bienvenida = ctk.CTkLabel(
     right_frame,
-    text="Bienvenido",
+    text=traducir("Bienvenido"),
     font=("Montserrat",45,"bold"),
     text_color=BLANCO
 )
@@ -2070,7 +3065,7 @@ bienvenida.pack(
 
 btn_reporte = ctk.CTkButton(
     right_frame,
-    text="🎹 INICIO",
+    text=traducir("🎹 INICIO"),
     width=420,
     height=75,
     corner_radius=35,
@@ -2088,18 +3083,104 @@ btn_reporte.pack(
 
 
 
+def elegir_idioma():
+    """
+    Ventana para escoger el idioma.
+
+    Hoy solo hay español. La ventana ya recorre TEXTOS, así que el día
+    que se agregue otro idioma aparece aquí solo, sin tocar esta parte.
+    """
+    ventana = ctk.CTkToplevel(app)
+    ventana.title(traducir("⚙ Idioma"))
+    ventana.geometry("460x420")
+    ventana.configure(fg_color=NEGRO)
+    ventana.resizable(False, False)
+    ventana.transient(app)
+    ventana.grab_set()
+
+    ctk.CTkLabel(
+        ventana,
+        text=traducir("🌎  Idioma"),
+        font=("Montserrat", 28, "bold"),
+        text_color=BLANCO
+    ).pack(pady=(26, 4))
+
+    ctk.CTkLabel(
+        ventana,
+        text=traducir("Se guarda y la próxima vez TALAT abre en ese idioma."),
+        font=("Montserrat", 14),
+        text_color=GRIS,
+        wraplength=380
+    ).pack(pady=(0, 18))
+
+    def poner(clave):
+        global IDIOMA
+
+        IDIOMA = clave
+
+        configuracion["idioma"] = clave
+        guardar_configuracion(configuracion)
+
+        registrar_evento(
+            "Configuración",
+            f"Idioma: {TEXTOS[clave].get('_nombre', clave)}",
+            "-"
+        )
+
+        aplicar_idioma()
+        ventana.destroy()
+
+    for clave, textos in TEXTOS.items():
+
+        actual = (clave == IDIOMA)
+
+        ctk.CTkButton(
+            ventana,
+            text=f"{textos.get('_bandera', '')}  {textos.get('_nombre', clave)}"
+                 + ("     ✓" if actual else ""),
+            width=340,
+            height=58,
+            corner_radius=14,
+            fg_color=AZUL if actual else GRIS2,
+            hover_color=MORADO,
+            font=("Montserrat", 18, "bold"),
+            command=lambda c=clave: poner(c)
+        ).pack(pady=6)
+
+    ctk.CTkLabel(
+        ventana,
+        text=traducir("Pronto habrá más idiomas."),
+        font=("Montserrat", 13),
+        text_color=GRIS3
+    ).pack(pady=(14, 0))
+
+    ctk.CTkButton(
+        ventana,
+        text="Cerrar",
+        width=160,
+        height=42,
+        fg_color=GRIS3,
+        hover_color=ROJOOS,
+        font=("Montserrat", 15, "bold"),
+        command=ventana.destroy
+    ).pack(pady=20)
+
+    traducir_ventana(ventana)
+
+
 btn_config = ctk.CTkButton(
     right_frame,
-    text="⚙ idioma",
+    text=traducir("⚙ Idioma"),
     width=420,
     height=75,
     corner_radius=35,
-    fg_color="#111111",
+    fg_color=NEGRO,
     border_width=2,
     border_color=MORADO,
-    hover_color="#222222",
+    hover_color=GRIS2,
     text_color=BLANCO,
-    font=("Montserrat",24,"bold")
+    font=("Montserrat",24,"bold"),
+    command=elegir_idioma
 )
 
 
@@ -2116,9 +3197,9 @@ btn_config.pack(
 
 footer = ctk.CTkLabel(
     bienvenido_frame,
-    text="Sistema Musical TALAT",
+    text=traducir("Sistema Musical TALAT"),
     font=("Montserrat",14),
-    text_color="#555555"
+    text_color=GRIS3
 )
 
 
@@ -2157,11 +3238,11 @@ header_inicio.pack(
 # Botón regresar
 btn_regresar = ctk.CTkButton(
     header_inicio,
-    text="← Bienvenido",
+    text=traducir("← Bienvenido"),
     width=140,
     height=40,
-    fg_color="#222222",
-    hover_color="#333333",
+    fg_color=GRIS2,
+    hover_color=GRIS4,
     command=mostrar_bienvenido
 )
 
@@ -2170,7 +3251,7 @@ btn_regresar.pack(side="left")
 # Título
 titulo_inicio = ctk.CTkLabel(
     header_inicio,
-    text="Usuarios",
+    text=traducir("Usuarios"),
     font=("Montserrat", 34, "bold"),
     text_color=BLANCO
 )
@@ -2187,7 +3268,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
     resultado = {}
 
     ventana = ctk.CTkToplevel(app)
-    ventana.title(titulo)
+    ventana.title(traducir(titulo))
     ventana.geometry("560x560")
     ventana.configure(fg_color=NEGRO)
     ventana.resizable(False, False)
@@ -2198,7 +3279,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
 
     ctk.CTkLabel(
         ventana,
-        text=titulo,
+        text=traducir(titulo),
         font=("Montserrat", 26, "bold"),
         text_color=BLANCO
     ).pack(pady=(25, 20))
@@ -2206,7 +3287,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
     # ---- Nombre ----
     ctk.CTkLabel(
         ventana,
-        text="Nombre",
+        text=traducir("Nombre"),
         font=("Montserrat", 16, "bold"),
         text_color=BLANCO,
         anchor="w"
@@ -2216,7 +3297,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
         ventana,
         height=42,
         font=("Montserrat", 16),
-        placeholder_text="Nombre de la persona"
+        placeholder_text=traducir("Nombre de la persona")
     )
 
     entrada_nombre.pack(fill="x", padx=40, pady=(4, 14))
@@ -2225,7 +3306,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
     # ---- Edad ----
     ctk.CTkLabel(
         ventana,
-        text="Edad",
+        text=traducir("Edad"),
         font=("Montserrat", 16, "bold"),
         text_color=BLANCO,
         anchor="w"
@@ -2235,7 +3316,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
         ventana,
         height=42,
         font=("Montserrat", 16),
-        placeholder_text="Años cumplidos"
+        placeholder_text=traducir("Años cumplidos")
     )
 
     entrada_edad.pack(fill="x", padx=40, pady=(4, 14))
@@ -2244,7 +3325,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
     # ---- Motivo ----
     ctk.CTkLabel(
         ventana,
-        text="¿Por qué usa TALAT?",
+        text=traducir("¿Por qué usa TALAT?"),
         font=("Montserrat", 16, "bold"),
         text_color=BLANCO,
         anchor="w"
@@ -2252,7 +3333,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
 
     ctk.CTkLabel(
         ventana,
-        text="Escríbelo con tus palabras. Este texto aparecerá en su perfil.",
+        text=traducir("Escríbelo con tus palabras. Este texto aparecerá en su perfil."),
         font=("Montserrat", 13),
         text_color=GRIS,
         anchor="w",
@@ -2273,7 +3354,7 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
         ventana,
         text="",
         font=("Montserrat", 14, "bold"),
-        text_color="#FF9F43"
+        text_color=NARANJA
     )
 
     aviso.pack(pady=(0, 4))
@@ -2284,17 +3365,17 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
         motivo_nuevo = caja_motivo.get("1.0", "end").strip()
 
         if not nombre_nuevo:
-            aviso.configure(text="El nombre no puede quedar vacío.")
+            aviso.configure(text=traducir("El nombre no puede quedar vacío."))
             return
 
         # La edad puede quedar vacía, pero si se escribe debe ser un número real.
         if edad_nueva:
             if not edad_nueva.isdigit():
-                aviso.configure(text="La edad debe ser un número.")
+                aviso.configure(text=traducir("La edad debe ser un número."))
                 return
 
             if not (1 <= int(edad_nueva) <= 120):
-                aviso.configure(text="La edad debe estar entre 1 y 120.")
+                aviso.configure(text=traducir("La edad debe estar entre 1 y 120."))
                 return
 
         resultado["nombre"] = nombre_nuevo
@@ -2322,13 +3403,15 @@ def dialogo_datos_usuario(titulo, nombre="", edad="", motivo=""):
         text="Cancelar",
         width=180,
         height=44,
-        fg_color="#3A3A3A",
-        hover_color="#B22222",
+        fg_color=GRIS3,
+        hover_color=ROJOOS,
         font=("Montserrat", 16, "bold"),
         command=ventana.destroy
     ).grid(row=0, column=1, padx=10)
 
     entrada_nombre.focus()
+
+    traducir_ventana(ventana)
 
     # Detiene la ejecución aquí hasta que se cierre la ventana.
     ventana.wait_window()
@@ -2355,13 +3438,242 @@ def agregar_usuario():
 
     guardar_usuarios(usuarios_db)
 
+    registrar_evento(
+        "Alta de la persona",
+        datos["motivo"] or "Sin motivo registrado",
+        nombre
+    )
+
     mensaje_vacio.pack_forget()
     crear_tarjeta_usuario(nombre)
+
+def abrir_GRAFICA_PARA_IMPRIMIR_en_excel():
+    """
+    Abre el CSV con el programa que tenga la computadora
+    (Excel en Windows, Numbers en Mac, LibreOffice en Linux).
+    """
+    exportar_bitacora_csv()
+    ruta = os.path.abspath(ARCHIVO_GRAFICA_PARA_IMPRIMIR)
+
+    if not os.path.exists(ruta):
+        return False, "Todavía no hay nada registrado."
+
+    try:
+        import subprocess
+        import sys
+
+        if sys.platform.startswith("win"):
+            os.startfile(ruta)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", ruta])
+        else:
+            subprocess.Popen(["xdg-open", ruta])
+
+        return True, ""
+
+    except Exception as e:
+        return False, str(e)
+
+
+def mostrar_graficaparaimprimir():
+    """
+    Muestra la bitácora dentro de TALAT.
+
+    Sirve para enseñarla en el momento aunque la computadora no tenga
+    Excel, y trae el botón para abrirla en Excel si sí lo tiene.
+    """
+    ventana = ctk.CTkToplevel(app)
+    ventana.title(traducir("Gráfica para imprimir de TALAT"))
+    ventana.geometry("1180x640")
+    ventana.configure(fg_color=NEGRO)
+    ventana.transient(app)
+    ventana.grab_set()
+
+    ctk.CTkLabel(
+        ventana,
+        text=traducir ("📄  Gráfica para imprimir de TALAT"),
+        font=("Montserrat", 28, "bold"),
+        text_color=BLANCO
+    ).pack(pady=(20, 2))
+
+    ruta = os.path.abspath(ARCHIVO_GRAFICA_PARA_IMPRIMIR)
+
+    ctk.CTkLabel(
+        ventana,
+        text=f"{traducir('Todo queda guardado en:')}  {ruta}",
+        font=("Montserrat", 12),
+        text_color=GRIS,
+        wraplength=900
+    ).pack(pady=(0, 12))
+
+    aviso = ctk.CTkLabel(
+        ventana,
+        text="",
+        font=("Montserrat", 14, "bold"),
+        text_color=NARANJA
+    )
+
+    aviso.pack()
+
+    def en_excel():
+        listo, motivo = abrir_GRAFICA_PARA_IMPRIMIR_en_excel()
+
+        if listo:
+            aviso.configure(text=traducir("Abriendo..."), text_color=VERDE)
+        else:
+            aviso.configure(text=traducir(motivo), text_color=NARANJA)
+
+    ctk.CTkButton(
+        ventana,
+        text=traducir("📊 Abrir el registro (CSV)"),
+        width=240,
+        height=44,
+        fg_color=VERDE,
+        text_color=NEGRO,
+        hover_color=MORADO,
+        font=("Montserrat", 16, "bold"),
+        command=en_excel
+    ).pack(pady=(6, 14))
+
+    tabla = ctk.CTkScrollableFrame(ventana, fg_color=NEGRO)
+    tabla.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+    filas = []
+    exportar_bitacora_csv()
+
+    try:
+        with open(ARCHIVO_GRAFICA_PARA_IMPRIMIR, "r", encoding="utf-8-sig") as archivo:
+            filas = [f for f in csv.reader(archivo) if f]
+
+    except FileNotFoundError:
+        filas = []
+    except Exception as e:
+        print("No se pudo leer la Gráfica:", e)
+
+    if len(filas) <= 1:
+        ctk.CTkLabel(
+            tabla,
+            text="Todavía no hay nada registrado.\n\n"
+                 "Inicia una sesión y vuelve a entrar aquí.",
+            font=("Montserrat", 18),
+            text_color=GRIS,
+            justify="center"
+        ).pack(pady=120)
+
+    else:
+        # Se muestran las columnas más útiles de un vistazo. El resto
+        # (edad, duración, observaciones) están en el archivo de Excel.
+        columnas_visibles = [0, 1, 2, 4, 5, 8, 9, 10]
+        anchos = [90, 60, 130, 150, 240, 110, 100, 200]
+
+        encabezado = filas[0]
+
+        # Las más nuevas arriba, y como mucho 300 para que no se
+        # tarde en abrir cuando el archivo ya tenga meses de uso.
+        cuerpo = filas[1:][-300:][::-1]
+
+        ctk.CTkLabel(
+            ventana,
+            text=f"{len(filas) - 1} {traducir('registros en total')}"
+                 + (f" · {traducir('se muestran los 300 más recientes')}"
+                    if len(cuerpo) >= 300 else ""),
+            font=("Montserrat", 13),
+            text_color=GRIS
+        ).pack(before=tabla, pady=(0, 6))
+
+        fila_titulos = ctk.CTkFrame(tabla, fg_color=GRIS2, corner_radius=8)
+        fila_titulos.pack(fill="x", pady=(0, 4))
+
+        for posicion, columna in enumerate(columnas_visibles):
+            titulo = encabezado[columna] if columna < len(encabezado) else ""
+
+            ctk.CTkLabel(
+                fila_titulos,
+                text=titulo.upper(),
+                font=("Montserrat", 11, "bold"),
+                text_color=BLANCO,
+                width=anchos[posicion],
+                anchor="w"
+            ).pack(side="left", padx=6, pady=6)
+
+        colores_evento = {
+            "Inicio de sesión": AZUL,
+            "Fin de sesión": AZUL,
+            "Expresión lograda": BLANCO,
+            "Actividad completada": AMARILLO,
+            "Gesto personalizado": VERDE,
+            "Alta de la persona": MORADO,
+            "Equipo": GRIS,
+            "Configuración": GRIS
+        }
+
+        for numero, fila in enumerate(cuerpo):
+
+            marco = ctk.CTkFrame(
+                tabla,
+                fg_color=NEGRO2 if numero % 2 == 0 else NEGRO2,
+                corner_radius=6
+            )
+
+            marco.pack(fill="x", pady=1)
+
+            for posicion, columna in enumerate(columnas_visibles):
+                texto = fila[columna] if columna < len(fila) else ""
+
+                # La columna 4 es el tipo de registro: va en color.
+                # La 9 es la intensidad: verde cuando fue marcada.
+                if columna == 4:
+                    color = colores_evento.get(texto, BLANCO)
+                elif columna == 9:
+                    color = {"Marcada": VERDE,
+                             "Moderada": AZUL,
+                             "Leve": NARANJA}.get(texto, GRIS)
+                elif columna == 2:
+                    color = BLANCO
+                else:
+                    color = GRIS
+
+                ctk.CTkLabel(
+                    marco,
+                    text=texto,
+                    font=("Montserrat", 11,
+                          "bold" if columna in (4, 9) else "normal"),
+                    text_color=color,
+                    width=anchos[posicion],
+                    anchor="w"
+                ).pack(side="left", padx=6, pady=4)
+
+    ctk.CTkButton(
+        ventana,
+        text="Cerrar",
+        width=160,
+        height=42,
+        fg_color=AZUL,
+        hover_color=MORADO,
+        font=("Montserrat", 15, "bold"),
+        command=ventana.destroy
+    ).pack(pady=(0, 16))
+
+    traducir_ventana(ventana)
+
+
+btn_graficaparaimprimir = ctk.CTkButton(
+    header_inicio,
+    text=traducir("📄 Generar reporte PDF"),
+    width=150,
+    height=45,
+    fg_color=GRIS2,
+    hover_color=MORADO,
+    command=mostrar_graficaparaimprimir
+)
+
+btn_graficaparaimprimir.pack(side="right", padx=(0, 10))
+
 
 # Botón agregar usuario
 btn_agregar = ctk.CTkButton(
     header_inicio,
-    text="➕ Agregar usuario",
+    text=traducir("➕ Agregar usuario"),
     width=180,
     height=45,
     fg_color=AZUL,
@@ -2399,7 +3711,10 @@ def resumen_usuario(datos):
     partes = []
 
     if edad:
-        partes.append(f"{edad} años")
+        # "9 años" o "9 years", según el idioma que esté puesto.
+        partes.append(
+            f"{edad} years" if IDIOMA == "en" else f"{edad} años"
+        )
 
     if motivo:
         # En la tarjeta solo cabe una línea; el texto completo va en el perfil.
@@ -2411,7 +3726,7 @@ def resumen_usuario(datos):
         partes.append(corto)
 
     if not partes:
-        return "Sin datos personales · edítalos desde su perfil"
+        return traducir("Sin datos personales · edítalos desde su perfil")
 
     return "  ·  ".join(partes)
 
@@ -2421,7 +3736,7 @@ def crear_tarjeta_usuario(nombre):
 
     tarjeta = ctk.CTkFrame(
         usuarios_container,
-        fg_color="#1A1A1A",
+        fg_color=NEGRO2,
         corner_radius=20,
         height=110
     )
@@ -2461,7 +3776,7 @@ def crear_tarjeta_usuario(nombre):
 
     btn_perfil = ctk.CTkButton(
         tarjeta,
-        text="📊 Ver perfil",
+        text=traducir("📊 Ver perfil"),
         width=180,
         height=45,
         fg_color=AZUL,
@@ -2538,11 +3853,10 @@ header_sesion.pack(
 
 btn_regresar_sesion = ctk.CTkButton(
     header_sesion,
-    text="⏹ Terminar sesión",
+    text=traducir("⏹ Terminar sesión"),
     width=190,
     height=45,
-    fg_color="#B22222",
-    hover_color="#8B0000",
+    fg_color=ROJOOS,
     command=terminar_sesion)
 
 btn_regresar_sesion.pack(
@@ -2552,7 +3866,7 @@ btn_regresar_sesion.pack(
 
 titulo_sesion = ctk.CTkLabel(
     header_sesion,
-    text="🎵 Sesión TALAT",
+    text=traducir("🎵 Sesión TALAT"),
     font=("Montserrat",34,"bold"),
     text_color=BLANCO
 )
@@ -2561,6 +3875,60 @@ titulo_sesion.pack(
     side="left",
     padx=30
 )
+
+# Estado del piano físico. Se actualiza solo cuando termina la
+# búsqueda del Arduino, que corre en segundo plano.
+estado_piano = ctk.CTkLabel(
+    header_sesion,
+    text="🔌 Buscando el piano...",
+    font=("Montserrat", 14, "bold"),
+    text_color=GRIS,
+    wraplength=260,
+    justify="right"
+)
+
+estado_piano.pack(side="right", padx=10)
+
+
+def probar_piano():
+    """Recorre las doce teclas del piano físico, para revisar el cableado."""
+    if not piano_hardware.disponible():
+        estado_piano.configure(
+            text="🔌 No hay piano conectado",
+            text_color=NARANJA
+        )
+        return
+
+    estado_piano.configure(
+        text=f"🎹 Probando las {len(NOTAS_DEL_PIANO)} teclas...",
+        text_color=AZUL
+    )
+
+    def terminar():
+        estado_piano.configure(
+            text=f"🎹 Piano conectado ({piano_hardware.puerto})",
+            text_color=VERDE
+        )
+
+    def correr():
+        piano_hardware.probar()
+        app.after(0, terminar)
+
+    threading.Thread(target=correr, daemon=True).start()
+
+
+btn_probar_piano = ctk.CTkButton(
+    header_sesion,
+    text=traducir("🔧 Probar piano"),
+    width=140,
+    height=38,
+    fg_color=GRIS2,
+    hover_color=MORADO,
+    font=("Montserrat", 13, "bold"),
+    command=probar_piano
+)
+
+btn_probar_piano.pack(side="right", padx=6)
 
 
 
@@ -2591,7 +3959,7 @@ camara_label = ctk.CTkLabel(
     text="📷 Cámara TALAT",
     width=600,
     height=450,
-    fg_color="#111111",
+    fg_color=NEGRO,
     text_color=GRIS,
     font=("Montserrat",25)
 )
@@ -2607,7 +3975,7 @@ camara_label.pack(
 
 info_sesion = ctk.CTkFrame(
     zona_sesion,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20,
     width=460,
     height=400,
@@ -2629,11 +3997,11 @@ info_sesion.pack_propagate(False)
 emoji_label = ctk.CTkLabel(
     info_sesion,
     text="😐",
-    font=("Segoe UI Emoji", 300)
+    font=("Segoe UI Emoji", 190)
 )
 
 emoji_label.pack(
-    pady=(20,5)
+    pady=(10,0)
 )
 
 
@@ -2680,7 +4048,7 @@ estado_nota = ctk.CTkLabel(
 )
 
 estado_nota.pack(
-    pady=20
+    pady=(10, 10)
 )
 
 # ------------------------
@@ -2690,14 +4058,14 @@ estado_nota.pack(
 mensaje_label = ctk.CTkLabel(
     info_sesion,
     text="Haz una expresión",
-    font=("Montserrat",22),
-    wraplength=260,
+    font=("Montserrat",20),
+    wraplength=380,
     justify="center",
     text_color=GRIS
 )
 
 mensaje_label.pack(
-    pady=20
+    pady=(0, 8)
 )
 
 # ------------------------
@@ -2732,7 +4100,7 @@ botones_modo.pack(
 
 btn_terapia = ctk.CTkButton(
     botones_modo,
-    text="🧠 Modo Terapia",
+    text=traducir("🧠 Modo Terapia"),
     width=250,
     height=55,
     fg_color=AZUL,
@@ -2750,10 +4118,10 @@ btn_terapia.grid(
 
 btn_cancion = ctk.CTkButton(
     botones_modo,
-    text="🎼 Canción Guiada",
+    text=traducir("🎼 Canción Guiada"),
     width=250,
     height=55,
-    fg_color="#222222",
+    fg_color=GRIS2,
     hover_color=MORADO,
     font=("Montserrat",18,"bold")
 )
@@ -2767,10 +4135,10 @@ btn_cancion.grid(
 
 btn_libre = ctk.CTkButton(
     botones_modo,
-    text="🎛 Modo Libre",
+    text=traducir("🎛 Modo Libre"),
     width=250,
     height=55,
-    fg_color="#222222",
+    fg_color=GRIS2,
     hover_color=MORADO,
     font=("Montserrat",18,"bold")
 )
@@ -2780,6 +4148,62 @@ btn_libre.grid(
     column=2,
     padx=20
 )
+
+
+# ==========================================
+# SONIDO DE LAS EXPRESIONES
+# ==========================================
+#
+# Cuelga del panel de las expresiones, no de dentro: ese panel se
+# quita y se vuelve a poner cada vez que se cambia de modo, y el
+# selector desaparecía con él.
+#
+# Solo se muestra en Modo Terapia, que es el único donde aplica.
+# Se empaqueta con before=botones_modo para que siempre vuelva a su
+# lugar; sin eso, al reaparecer se iría hasta el final de la ventana.
+
+barra_sonido = ctk.CTkFrame(
+    sesion_frame,
+    fg_color=NEGRO2,
+    corner_radius=16
+)
+
+etiqueta_sonido_terapia = ctk.CTkLabel(
+    barra_sonido,
+    text=traducir("SONIDO"),
+    font=("Montserrat", 12, "bold"),
+    text_color=GRIS
+)
+
+etiqueta_sonido_terapia.pack(side="left", padx=(16, 10), pady=8)
+
+selector_sonido_terapia = ctk.CTkSegmentedButton(
+    barra_sonido,
+    values=["🎵 Notas", "🎹 Acordes"],
+    font=("Montserrat", 15, "bold"),
+    height=34,
+    selected_color=AZUL,
+    selected_hover_color=MORADO,
+    unselected_color=GRIS2,
+    command=cambiar_sonido_terapia
+)
+
+selector_sonido_terapia.set("🎵 Notas")
+
+selector_sonido_terapia.pack(side="left", padx=(0, 12), pady=8)
+
+
+def mostrar_sonido_terapia(visible):
+    """Aparece pegado al panel de las expresiones, solo en Terapia."""
+    if visible:
+        barra_sonido.pack(
+            before=botones_modo,
+            anchor="e",
+            padx=(0, 60),
+            pady=(4, 0)
+        )
+    else:
+        barra_sonido.pack_forget()
 
 
 # ==========================================
@@ -2794,7 +4218,7 @@ btn_libre.grid(
 
 panel_cancion = ctk.CTkFrame(
     zona_sesion,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20,
     width=470
 )
@@ -2813,14 +4237,14 @@ vista_menu = ctk.CTkFrame(
 
 ctk.CTkLabel(
     vista_menu,
-    text="🎼 ELIGE UNA CANCIÓN",
+    text=traducir("🎼 ELIGE UNA CANCIÓN"),
     font=("Montserrat", 22, "bold"),
     text_color=BLANCO
 ).pack(pady=(18, 2))
 
 ctk.CTkLabel(
     vista_menu,
-    text="Cada gesto de tu cara toca un acorde completo.",
+    text=traducir("Una sola expresión toca una frase completa de la melodía."),
     font=("Montserrat", 14),
     text_color=GRIS,
     wraplength=410
@@ -2861,115 +4285,113 @@ cancion_titulo = ctk.CTkLabel(
 
 cancion_titulo.pack(side="left")
 
-# Letra de la frase y recuadros de acordes.
+# Letra de la frase, cabecera y renglón de notas.
 
+cancion_cabecera = ctk.CTkLabel(
+    vista_tocar,
+    text="FRASE 1 DE 1",
+    font=("Montserrat", 20, "bold"),
+    text_color=AZUL
+)
+
+cancion_cabecera.pack(pady=(8, 2))
+
+cancion_barra = ctk.CTkProgressBar(
+    vista_tocar,
+    height=10,
+    corner_radius=5,
+    progress_color=AZUL
+)
+
+cancion_barra.set(0)
+
+cancion_barra.pack(fill="x", padx=25, pady=(0, 8))
+
+# La letra es lo que la persona canta o sigue con la vista:
+# va en grande y en blanco, no como texto secundario.
 cancion_letra = ctk.CTkLabel(
     vista_tocar,
     text="",
-    font=("Montserrat", 14),
-    text_color=GRIS,
-    wraplength=430
+    font=("Montserrat", 16, "bold"),
+    text_color=BLANCO,
+    wraplength=420,
+    justify="center"
 )
 
-cancion_letra.pack(pady=(6, 6))
+cancion_letra.pack(pady=(0, 8))
 
-fila_acordes = ctk.CTkFrame(
+# Renglón de notas. Alto fijo para tres filas: si creciera y encogiera
+# con cada frase, todo el panel daría saltos al cambiar de frase.
+fila_notas = ctk.CTkFrame(
     vista_tocar,
-    fg_color="transparent"
+    fg_color="transparent",
+    width=406,
+    height=116
 )
 
-fila_acordes.pack(pady=(0, 10))
+fila_notas.pack(pady=(0, 8))
+fila_notas.pack_propagate(False)
+fila_notas.grid_propagate(False)
 
 # Guardamos los recuadros para repintarlos sin recrearlos.
 chips_cancion = []
 frase_dibujada = -1
 
-# Acorde actual y gesto que hay que hacer.
+# Qué expresión hay que hacer para disparar la frase.
 
 zona_gesto = ctk.CTkFrame(
     vista_tocar,
-    fg_color="#111111",
+    fg_color=NEGRO,
     corner_radius=14
 )
 
 zona_gesto.pack(fill="x", padx=18, pady=(0, 8))
 
-cancion_acorde_actual = ctk.CTkLabel(
-    zona_gesto,
-    text="ACORDE: --",
-    font=("Montserrat", 21, "bold"),
-    text_color=AZUL
-)
-
-cancion_acorde_actual.pack(pady=(10, 0))
-
-cancion_notas_acorde = ctk.CTkLabel(
-    zona_gesto,
-    text="",
-    font=("Montserrat", 13),
-    text_color=GRIS
-)
-
-cancion_notas_acorde.pack()
-
+# Emoji a la izquierda y textos a la derecha: en vertical no cabían
+# el emoji grande, las tres filas de notas y los botones.
 cancion_emoji = ctk.CTkLabel(
     zona_gesto,
     text="🎵",
-    font=("Segoe UI Emoji", 80)
+    font=("Segoe UI Emoji", 52),
+    width=80
 )
 
-cancion_emoji.pack()
+cancion_emoji.grid(row=0, column=0, rowspan=2, padx=(14, 6), pady=10)
 
 cancion_gesto_titulo = ctk.CTkLabel(
     zona_gesto,
     text="",
-    font=("Montserrat", 16, "bold"),
-    text_color=BLANCO
+    font=("Montserrat", 17, "bold"),
+    text_color=BLANCO,
+    anchor="w",
+    justify="left"
 )
 
-cancion_gesto_titulo.pack()
+cancion_gesto_titulo.grid(row=0, column=1, sticky="sw", padx=(0, 14))
 
 cancion_gesto_como = ctk.CTkLabel(
     zona_gesto,
     text="",
     font=("Montserrat", 13),
     text_color=GRIS,
-    wraplength=390,
-    justify="center"
+    wraplength=290,
+    anchor="w",
+    justify="left"
 )
 
-cancion_gesto_como.pack(pady=(2, 6))
+cancion_gesto_como.grid(row=1, column=1, sticky="nw", padx=(0, 14))
+
+zona_gesto.grid_columnconfigure(1, weight=1)
 
 cancion_feedback = ctk.CTkLabel(
     zona_gesto,
     text="",
-    font=("Montserrat", 14, "bold"),
-    text_color=GRIS
+    font=("Montserrat", 15, "bold"),
+    text_color=GRIS,
+    wraplength=400
 )
 
-cancion_feedback.pack(pady=(0, 10))
-
-# Progreso.
-
-cancion_progreso_texto = ctk.CTkLabel(
-    vista_tocar,
-    text="Progreso: ░░░░░░░░░░ 0%",
-    font=("Consolas", 15, "bold"),
-    text_color=GRIS
-)
-
-cancion_progreso_texto.pack(pady=(0, 4))
-
-cancion_barra = ctk.CTkProgressBar(
-    vista_tocar,
-    height=14,
-    corner_radius=7,
-    progress_color=AZUL
-)
-
-cancion_barra.set(0)
-
-cancion_barra.pack(fill="x", padx=25, pady=(0, 10))
+cancion_feedback.grid(row=2, column=0, columnspan=2, pady=(0, 10))
 
 # Botones de control.
 
@@ -2985,10 +4407,6 @@ controles_cancion.pack(pady=(0, 12))
 # FUNCIONES DEL PANEL
 # ------------------------------------------
 
-def texto_barra(proporcion, bloques=10):
-    llenos = int(round(proporcion * bloques))
-    return "█" * llenos + "░" * (bloques - llenos)
-
 def construir_menu_canciones():
     """Crea una tarjeta por cada canción."""
 
@@ -2999,7 +4417,7 @@ def construir_menu_canciones():
 
         tarjeta = ctk.CTkFrame(
             lista_canciones,
-            fg_color="#111111",
+            fg_color=NEGRO,
             corner_radius=14
         )
 
@@ -3018,17 +4436,31 @@ def construir_menu_canciones():
             pady=(12, 0)
         )
 
+        # Subtítulo y etiqueta de dificultad, en la misma línea.
+        linea_subtitulo = ctk.CTkFrame(tarjeta, fg_color="transparent")
+        linea_subtitulo.pack(anchor="w", fill="x", padx=15)
+
         ctk.CTkLabel(
-            tarjeta,
-            text=cancion["subtitulo"],
+            linea_subtitulo,
+            text=traducir(cancion["subtitulo"]),
             font=("Montserrat", 13),
             text_color=GRIS
-        ).pack(
-            anchor="w",
-            padx=15
-        )
+        ).pack(side="left")
 
-        # Gestos que se necesitan.
+        dificultad = cancion.get("dificultad", "")
+
+        if dificultad:
+            ctk.CTkLabel(
+                linea_subtitulo,
+                text=f" {traducir(dificultad)} ",
+                font=("Montserrat", 12, "bold"),
+                text_color=NEGRO,
+                fg_color=COLOR_DIFICULTAD.get(dificultad, GRIS),
+                corner_radius=8,
+                height=22
+            ).pack(side="right")
+
+        # Expresiones que hacen falta, sin repetir.
         fila_gestos = ctk.CTkFrame(
             tarjeta,
             fg_color="transparent"
@@ -3040,16 +4472,16 @@ def construir_menu_canciones():
             pady=(6, 0)
         )
 
-        for gesto in gestos_usados(cancion):
+        for gesto in dict.fromkeys(gestos_usados(cancion)):
 
             guia = GUIA_DE_GESTOS.get(gesto, {})
 
             ctk.CTkLabel(
                 fila_gestos,
-                text=f"{guia.get('emoji', '')} {gesto}",
+                text=f"{guia.get('emoji', '')} {traducir(gesto)}",
                 font=("Montserrat", 13, "bold"),
                 text_color=BLANCO,
-                fg_color="#2B2B2B",
+                fg_color=GRIS2,
                 corner_radius=8,
                 width=120,
                 height=32
@@ -3058,12 +4490,24 @@ def construir_menu_canciones():
                 padx=3
             )
 
-        total_bloques = len(cancion["bloques"])
+        total_frases = len(cancion["frases"])
+
+        total_notas = sum(
+            len(frase.get("notas", []))
+            for frase in cancion["frases"]
+        )
+
+        segundos = sum(
+            partes_de_nota(nota)[1]
+            for frase in cancion["frases"]
+            for nota in frase.get("notas", [])
+        ) * cancion.get("pulso", PULSO_MELODIA)
 
         ctk.CTkLabel(
             tarjeta,
-            text=f"{total_bloques} bloques musicales · "
-                 f"{total_bloques} gestos",
+            text=f"{total_frases} {traducir('frases')} · "
+                 f"{total_notas} {traducir('notas')} · "
+                 f"{int(segundos)} {traducir('segundos de música')}",
             font=("Montserrat", 12),
             text_color=GRIS
         ).pack(
@@ -3074,7 +4518,7 @@ def construir_menu_canciones():
 
         ctk.CTkButton(
             tarjeta,
-            text="▶ TOCAR ESTA CANCIÓN",
+            text=traducir("▶ TOCAR ESTA CANCIÓN"),
             height=38,
             fg_color=AZUL,
             hover_color=MORADO,
@@ -3085,6 +4529,7 @@ def construir_menu_canciones():
             padx=15,
             pady=12
         )
+
 
 def mostrar_menu_canciones():
     """Vuelve al menú de selección."""
@@ -3106,8 +4551,20 @@ def abrir_cancion(clave):
     vista_menu.pack_forget()
     vista_tocar.pack(fill="both", expand=True)
 
-    dibujar_acordes_frase(forzar=True)
+    cancion_barra.configure(progress_color=AZUL)
+
+    dibujar_notas_frase(forzar=True)
     actualizar_panel_cancion()
+
+
+def poner_feedback(texto, color):
+    """No repinta si el mensaje es el mismo que ya está en pantalla."""
+    texto = traducir(texto)
+
+    if cancion_feedback.cget("text") == texto:
+        return
+
+    cancion_feedback.configure(text=texto, text_color=color)
 
 
 def refrescar_deteccion_cancion():
@@ -3119,84 +4576,100 @@ def refrescar_deteccion_cancion():
     objetivo = cancion_guiada.gesto_actual()
 
     if gesto == "REPOSO":
-        cancion_feedback.configure(
-            text="Esperando tu gesto...",
-            text_color=GRIS
-        )
+        poner_feedback("Esperando tu expresión...", GRIS)
+
     elif cancion_guiada.esperando_reposo:
-        cancion_feedback.configure(
-            text="Relaja la cara para el siguiente acorde",
-            text_color=AZUL
-        )
+        poner_feedback("Relaja la cara para la siguiente frase", AZUL)
+
     elif gesto != objetivo:
-        acorde_equivocado = ACORDE_POR_GESTO.get(gesto)
+        guia_objetivo = GUIA_DE_GESTOS.get(objetivo, {})
+        titulo = guia_objetivo.get("titulo", objetivo).lower()
 
-        if acorde_equivocado:
-            aviso = f"Eso es {acorde_equivocado}, no {cancion_guiada.acorde_actual()}"
-        else:
-            aviso = f"{gesto} no se usa en esta canción"
+        poner_feedback(f"Ahora toca: {titulo}", NARANJA)
 
-        cancion_feedback.configure(text=aviso, text_color="#FF9F43")
 
-def dibujar_acordes_frase(forzar=False):
+def dibujar_notas_frase(forzar=False):
     """
-    Muestra los acordes que forman el bloque actual.
-    Todos pertenecen al mismo bloque musical.
+    Dibuja los recuadros con las notas de la frase actual.
+
+    Solo se rehacen cuando cambia la frase. Rehacerlos en cada
+    actualización borraba los recuadros justo cuando la melodía
+    empezaba a iluminarlos, y la primera nota nunca se veía.
     """
+    global frase_dibujada
 
     if not cancion_guiada.cargada():
         return
 
-    bloque = cancion_guiada.bloque_actual()
+    frase = cancion_guiada.frase_actual()
 
-    if bloque is None:
+    if frase is None:
         return
+
+    if not forzar and frase_dibujada == cancion_guiada.indice:
+        return
+
+    frase_dibujada = cancion_guiada.indice
 
     for chip in chips_cancion:
         chip.destroy()
 
     chips_cancion.clear()
 
-    for acorde in bloque["acordes"]:
+    notas = nombres_de_notas(frase.get("notas", []))
+
+    activo = cancion_guiada.estado in ("tocando", "pausada", "reproduciendo")
+
+    for posicion, nota in enumerate(notas):
 
         chip = ctk.CTkLabel(
-            fila_acordes,
-            text=acorde,
-            width=70,
-            height=40,
+            fila_notas,
+            text=nota,
+            width=52,
+            height=30,
             corner_radius=10,
-            fg_color="#2B2B2B",
-            text_color=GRIS,
-            font=("Montserrat", 14, "bold")
+            fg_color=MORADO if activo else GRIS2,
+            text_color=BLANCO if activo else GRIS,
+            font=("Montserrat", 13, "bold")
         )
 
-        chip.pack(
-            side="left",
-            padx=3
+        chip.grid(
+            row=posicion // 7,
+            column=posicion % 7,
+            padx=3,
+            pady=3
         )
 
         chips_cancion.append(chip)
 
-    # Mientras el bloque se reproduce,
-    # todos sus acordes se muestran activos.
-    if cancion_guiada.estado == "reproduciendo":
 
-        for i, chip in enumerate(chips_cancion):
+def resaltar_nota(indice_frase, posicion):
+    """
+    Ilumina la nota que suena en este instante (efecto karaoke).
 
-            acorde = bloque["acordes"][i]
+    Solo toca DOS recuadros: el que acaba de sonar y el que suena.
+    Repintar los diecisiete en cada nota sí se notaría en la Raspberry.
+    """
+    if indice_frase != cancion_guiada.indice:
+        return
 
-            chip.configure(
-                fg_color=ACORDES[acorde]["color"],
+    try:
+        if 0 < posicion < len(chips_cancion):
+            chips_cancion[posicion - 1].configure(
+                fg_color="#3A2A5C",
+                text_color=GRIS
+            )
+
+        if posicion < len(chips_cancion):
+            chips_cancion[posicion].configure(
+                fg_color=AMARILLO,
                 text_color=NEGRO
             )
 
-    elif cancion_guiada.estado in ("tocando", "pausada"):
+    except Exception:
+        # Los recuadros se rehicieron mientras sonaba la frase.
+        pass
 
-        for chip in chips_cancion:
-            chip.configure(
-                fg_color=MORADO,
-                text_color=BLANCO
-            )
 
 def actualizar_panel_cancion():
     """Actualiza la pantalla de Canción Guiada."""
@@ -3210,170 +4683,117 @@ def actualizar_panel_cancion():
         text=cancion["titulo"]
     )
 
-    total_bloques = cancion_guiada.total_bloques()
+    total_frases = cancion_guiada.total_frases()
+
+    # ---------- canción terminada ----------
 
     if cancion_guiada.estado == "terminada":
 
+        cancion_cabecera.configure(
+            text="🎉 ¡CANCIÓN COMPLETADA!",
+            text_color=AMARILLO
+        )
+
         cancion_letra.configure(
-            text="🎉 ¡Terminaste la canción!"
+            text=f"Tocaste la canción entera con {total_frases} expresiones."
         )
 
-        cancion_acorde_actual.configure(
-            text="¡CANCIÓN COMPLETADA!",
-            text_color="#FFD93D"
-        )
-
-        cancion_notas_acorde.configure(
-            text=""
-        )
-
-        cancion_emoji.configure(
-            text="🌟"
-        )
+        cancion_emoji.configure(text="🌟")
 
         cancion_gesto_titulo.configure(
-            text=f"Tocaste {total_bloques} bloques con {total_bloques} gestos",
-            text_color=BLANCO
+            text="Muy bien",
+            text_color=AMARILLO
         )
 
         cancion_gesto_como.configure(
-            text="Pulsa REINICIAR para tocarla otra vez."
+            text="Pulsa ↻ REINICIAR para tocarla otra vez, "
+                 "o ← Canciones para elegir otra."
         )
 
-        cancion_feedback.configure(
-            text=""
-        )
+        poner_feedback("", GRIS)
 
         cancion_barra.set(1)
-        cancion_progreso_texto.configure(
-            text=f"Progreso: {texto_barra(1.0)} 100%"
-        )
-
-        cancion_barra.configure(
-            progress_color="#FFD93D"
-        )
+        cancion_barra.configure(progress_color=AMARILLO)
 
         registrar_cancion_completada()
 
         return
 
-    bloque = cancion_guiada.bloque_actual()
+    frase = cancion_guiada.frase_actual()
 
-    if bloque is None:
+    if frase is None:
         return
 
     numero = cancion_guiada.indice + 1
-
-    cancion_letra.configure(
-        text=(
-            f"Bloque {numero} de {total_bloques}\n\n"
-            f"{bloque['letra']}"
-        )
-    )
-
-    dibujar_acordes_frase(forzar=True)
-
-    proporcion = cancion_guiada.progreso()
-    porcentaje = int(round(proporcion * 100))
-
-    cancion_barra.set(proporcion)
-
-    cancion_progreso_texto.configure(
-        text=(
-            f"Progreso: {texto_barra(proporcion)} "
-            f"{porcentaje}%   "
-            f"({numero}/{total_bloques})"
-        )
-    )
+    notas = cancion_guiada.notas_actuales()
 
     gesto = cancion_guiada.gesto_actual()
+    guia = GUIA_DE_GESTOS.get(gesto, {})
+    color_gesto = COLORES_POR_EMOCION.get(gesto, MORADO)
 
-    guia = GUIA_DE_GESTOS.get(
-        gesto,
-        {}
-    )
+    cancion_letra.configure(text=cancion_guiada.letra_actual())
 
-    color_gesto = COLORES_POR_EMOCION.get(
-        gesto,
-        MORADO
-    )
+    dibujar_notas_frase()
 
-    cancion_emoji.configure(
-        text=guia.get("emoji", "🎵")
-    )
+    cancion_barra.set(cancion_guiada.progreso())
+    cancion_barra.configure(progress_color=color_gesto)
+
+    # ---------- la melodía está sonando ----------
 
     if cancion_guiada.estado == "reproduciendo":
 
-        cancion_acorde_actual.configure(
-            text="🎵 TOCANDO EL BLOQUE...",
+        cancion_cabecera.configure(
+            text=f"🎶 SONANDO LA FRASE {numero}",
             text_color=AZUL
         )
 
-        cancion_notas_acorde.configure(
-            text="Puedes relajar tu rostro"
-        )
+        cancion_emoji.configure(text="🎧")
 
         cancion_gesto_titulo.configure(
-            text="Muy bien",
+            text="Puedes relajar la cara",
             text_color=AZUL
         )
 
         cancion_gesto_como.configure(
-            text="El bloque está sonando. Descansa."
+            text="Sigue las notas amarillas mientras suena la melodía."
         )
 
-        cancion_feedback.configure(
-            text="🎶 Escucha y descansa...",
-            text_color=AZUL
-        )
+        poner_feedback("Escucha y descansa...", AZUL)
+
+        return
+
+    # ---------- esperando la expresión ----------
+
+    if IDIOMA == "en":
+        texto_cabecera = f"PHRASE {numero} OF {total_frases}   ·   {len(notas)} notes"
+    else:
+        texto_cabecera = f"FRASE {numero} DE {total_frases}   ·   {len(notas)} notas"
+
+    cancion_cabecera.configure(
+        text=texto_cabecera,
+        text_color=color_gesto
+    )
+
+    cancion_emoji.configure(text=guia.get("emoji", "🎵"))
+    cancion_gesto_titulo.configure(
+        text=traducir(guia.get("titulo", "")),
+        text_color=color_gesto
+    )
+
+    cancion_gesto_como.configure(text=traducir(guia.get("como", "")))
+
+    if cancion_guiada.estado == "detenida":
+        poner_feedback("Pulsa ▶ INICIAR para empezar", GRIS)
+
+    elif cancion_guiada.estado == "pausada":
+        poner_feedback("⏸ En pausa", NARANJA)
+
+    elif cancion_guiada.esperando_reposo:
+        poner_feedback("Relaja la cara para la siguiente frase", AZUL)
 
     else:
+        poner_feedback("Haz esta expresión una vez", GRIS)
 
-        cancion_acorde_actual.configure(
-            text=f"BLOQUE {numero}",
-            text_color=color_gesto
-        )
-
-        cancion_notas_acorde.configure(
-            text=" + ".join(bloque["acordes"])
-        )
-
-        cancion_gesto_titulo.configure(
-            text=guia.get("titulo", ""),
-            text_color=color_gesto
-        )
-
-        cancion_gesto_como.configure(
-            text=guia.get("como", "")
-        )
-
-        if cancion_guiada.estado == "detenida":
-
-            cancion_feedback.configure(
-                text="Pulsa ▶ INICIAR",
-                text_color=GRIS
-            )
-
-        elif cancion_guiada.estado == "pausada":
-
-            cancion_feedback.configure(
-                text="⏸ En pausa",
-                text_color="#FF9F43"
-            )
-
-        elif cancion_guiada.esperando_reposo:
-
-            cancion_feedback.configure(
-                text="Relaja tu rostro para continuar",
-                text_color=AZUL
-            )
-
-        else:
-
-            cancion_feedback.configure(
-                text="Haz el gesto indicado una vez",
-                text_color=GRIS
-            )
 
 def registrar_cancion_completada():
     """Suma la canción al perfil del usuario, una sola vez."""
@@ -3388,11 +4808,22 @@ def registrar_cancion_completada():
 
     guardar_usuarios(usuarios_db)
 
+    registrar_evento(
+        "Actividad completada",
+        f"Canción: {cancion_guiada.cancion.get('titulo', cancion_guiada.clave)}",
+        expresiones=str(cancion_guiada.aciertos)
+    )
+
     cancion_guiada.ya_registrada = cancion_guiada.clave
 
 
 def iniciar_cancion():
     cancion_guiada.iniciar()
+
+    cancion_barra.configure(progress_color=AZUL)
+
+    # forzar: los recuadros pasan de gris apagado a morado activo.
+    dibujar_notas_frase(forzar=True)
     actualizar_panel_cancion()
 
 
@@ -3403,7 +4834,10 @@ def pausar_cancion():
 
 def reiniciar_cancion():
     cancion_guiada.reiniciar()
-    dibujar_acordes_frase(forzar=True)
+
+    cancion_barra.configure(progress_color=AZUL)
+
+    dibujar_notas_frase(forzar=True)
     actualizar_panel_cancion()
 
 
@@ -3414,7 +4848,7 @@ def reiniciar_cancion():
 
 panel_libre = ctk.CTkFrame(
     zona_sesion,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20,
     width=470
 )
@@ -3423,10 +4857,28 @@ panel_libre.pack_propagate(False)
 
 ctk.CTkLabel(
     panel_libre,
-    text="🎛 MODO LIBRE",
+    text=traducir("🎛 MODO LIBRE"),
     font=("Montserrat", 22, "bold"),
     text_color=BLANCO
 ).pack(pady=(14, 0))
+
+# Igual que el menú de canciones: una línea que explica de qué va.
+ctk.CTkLabel(
+    panel_libre,
+    text=traducir("Tú eliges el sonido y tú grabas la cara que lo toca."),
+    font=("Montserrat", 13),
+    text_color=GRIS,
+    wraplength=410
+).pack(pady=(0, 2))
+
+libre_contador = ctk.CTkLabel(
+    panel_libre,
+    text=traducir("0 de 8 sonidos"),
+    font=("Montserrat", 12, "bold"),
+    text_color=MORADO
+)
+
+libre_contador.pack(pady=(0, 6))
 
 lista_libre = ctk.CTkScrollableFrame(
     panel_libre,
@@ -3435,18 +4887,73 @@ lista_libre = ctk.CTkScrollableFrame(
 
 lista_libre.pack(fill="both", expand=True, padx=10)
 
-libre_feedback = ctk.CTkLabel(
+# Barra de estado: antes el texto flotaba suelto sobre el fondo y no
+# se distinguía de la lista. Con su propio recuadro se lee como un
+# renglón fijo donde siempre aparece lo que está pasando.
+barra_estado_libre = ctk.CTkFrame(
     panel_libre,
-    text="Agrega un sonido y graba su gesto.",
-    font=("Montserrat", 14, "bold"),
-    text_color=GRIS,
-    wraplength=420
+    fg_color=NEGRO,
+    corner_radius=12,
+    height=46
 )
 
-libre_feedback.pack(pady=(6, 4))
+barra_estado_libre.pack(fill="x", padx=14, pady=(8, 6))
+barra_estado_libre.pack_propagate(False)
+
+libre_feedback = ctk.CTkLabel(
+    barra_estado_libre,
+    text=traducir("Agrega un sonido y graba su gesto."),
+    font=("Montserrat", 14, "bold"),
+    text_color=GRIS,
+    wraplength=400
+)
+
+libre_feedback.pack(expand=True)
 
 botones_libre = ctk.CTkFrame(panel_libre, fg_color="transparent")
 botones_libre.pack(fill="x", padx=14, pady=(0, 12))
+
+# Cada fila de la lista, para poder iluminar la que suena.
+filas_libre = []
+
+
+def poner_estado_libre(texto, color):
+    """Escribe en la barra de estado sin repintar si no cambió."""
+    texto = traducir(texto)
+
+    if libre_feedback.cget("text") == texto:
+        return
+
+    libre_feedback.configure(text=texto, text_color=color)
+
+
+def marcar_fila_libre(indice, modo="normal"):
+    """
+    Resalta una fila: 'sonando' mientras el gesto está activo,
+    'grabando' mientras se captura, 'normal' el resto del tiempo.
+    """
+    colores = {
+        "normal": (NEGRO2, 0, NEGRO2),
+        "sonando": ("#1B2E45", 2, AZUL),
+        "grabando": ("#2A1B45", 2, MORADO)
+    }
+
+    fondo, grosor, borde = colores.get(modo, colores["normal"])
+
+    try:
+        for i, fila in enumerate(filas_libre):
+            if i == indice:
+                fila.configure(
+                    fg_color=fondo,
+                    border_width=grosor,
+                    border_color=borde
+                )
+            else:
+                fila.configure(fg_color=NEGRO, border_width=0)
+
+    except Exception:
+        # La lista se redibujó mientras tanto.
+        pass
 
 
 def dibujar_lista_libre():
@@ -3454,87 +4961,266 @@ def dibujar_lista_libre():
     for hijo in lista_libre.winfo_children():
         hijo.destroy()
 
+    filas_libre.clear()
+
+    total = len(instrumento_libre.ranuras)
+
+    libre_contador.configure(
+        text=f"{total} de 8 sonidos" if IDIOMA == "es" else f"{total} of 8 sounds"
+    )
+
     if not instrumento_libre.ranuras:
+        vacio = ctk.CTkFrame(lista_libre, fg_color="transparent")
+        vacio.pack(expand=True, pady=50)
+
         ctk.CTkLabel(
-            lista_libre,
-            text="Todavía no hay sonidos.\nPulsa «Agregar sonido» para empezar.",
+            vacio,
+            text="🎹",
+            font=("Segoe UI Emoji", 46)
+        ).pack()
+
+        ctk.CTkLabel(
+            vacio,
+            text="Todavía no hay sonidos.\n"
+                 "Pulsa «Agregar sonido» para empezar.",
             font=("Montserrat", 14),
             text_color=GRIS,
             justify="center"
-        ).pack(pady=40)
+        ).pack(pady=(4, 0))
         return
 
     for indice, ranura in enumerate(instrumento_libre.ranuras):
 
-        fila = ctk.CTkFrame(lista_libre, fg_color="#111111", corner_radius=12)
-        fila.pack(fill="x", pady=4)
-
-        arriba = ctk.CTkFrame(fila, fg_color="transparent")
-        arriba.pack(fill="x", padx=10, pady=(8, 2))
-
-        selector = ctk.CTkOptionMenu(
-            arriba,
-            values=list(ETIQUETA_A_SONIDO.keys()),
-            font=("Montserrat", 12),
-            fg_color="#2B2B2B",
-            button_color=AZUL,
-            button_hover_color=MORADO,
-            dynamic_resizing=False,
-            width=145,
-            command=lambda etiqueta, i=indice: cambiar_sonido_libre(i, etiqueta)
+        fila = ctk.CTkFrame(
+            lista_libre,
+            fg_color=NEGRO,
+            corner_radius=12
         )
 
-        selector.set(SONIDO_A_ETIQUETA.get(ranura["sonido"], "🎵 DO"))
-        selector.pack(side="left")
+        fila.pack(fill="x", pady=4)
+
+        filas_libre.append(fila)
+
+        arriba = ctk.CTkFrame(fila, fg_color="transparent")
+        arriba.pack(fill="x", padx=10, pady=(9, 2))
+
+        # Número de la ranura: ayuda a saber de cuál habla el mensaje
+        # de error cuando dos gestos se parecen demasiado.
+        ctk.CTkLabel(
+            arriba,
+            text=str(indice + 1),
+            width=26,
+            height=26,
+            corner_radius=13,
+            fg_color=GRIS2,
+            text_color=GRIS,
+            font=("Montserrat", 12, "bold")
+        ).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(
             arriba,
-            text="🎬 Grabar" if ranura["gesto"] is None else "🔄 Regrabar",
-            width=95,
-            height=50,
-            fg_color=AZUL if ranura["gesto"] is None else "#2B2B2B",
+            text=SONIDO_A_ETIQUETA.get(ranura["sonido"], "🎵 DO"),
+            width=150,
+            height=34,
+            corner_radius=8,
+            fg_color=GRIS2,
             hover_color=MORADO,
-            font=("Montserrat", 12, "bold"),
-            command=lambda i=indice: iniciar_grabacion_gesto(i)
-        ).pack(side="left", padx=4)
+            font=("Montserrat", 13, "bold"),
+            command=lambda i=indice: abrir_teclado_sonidos(i)
+        ).pack(side="left")
 
+        # Todos los controles a 34 de alto: antes los botones medían 50
+        # y el menú 28, así que la fila se veía escalonada.
         ctk.CTkButton(
             arriba,
             text="🗑",
             width=34,
-            height=50,
-            fg_color="#3A3A3A",
-            hover_color="#B22222",
-            font=("Montserrat", 12, "bold"),
+            height=34,
+            fg_color=GRIS2,
+            hover_color=ROJOOS,
+            font=("Montserrat", 14),
             command=lambda i=indice: quitar_sonido_libre(i)
-        ).pack(side="left", padx=2)
+        ).pack(side="right", padx=(6, 0))
+
+        ctk.CTkButton(
+            arriba,
+            text=traducir(
+                "🎬 Grabar" if ranura["gesto"] is None else "🔄 Regrabar"
+            ),
+            width=104,
+            height=34,
+            fg_color=AZUL if ranura["gesto"] is None else GRIS2,
+            hover_color=MORADO,
+            font=("Montserrat", 13, "bold"),
+            command=lambda i=indice: iniciar_grabacion_gesto(i)
+        ).pack(side="right")
 
         if ranura["gesto"] is None:
-            texto = "Sin gesto grabado"
-            color = "#FF9F43"
+            texto = "●  Sin gesto grabado"
+            color = NARANJA
         else:
-            texto = f"Tu gesto:  {ranura['texto']}"
-            color = AZUL
+            texto = f"●  {ranura['texto']}"
+            color = VERDE
 
         ctk.CTkLabel(
             fila,
             text=texto,
-            font=("Montserrat", 12),
+            font=("Montserrat", 12, "bold"),
             text_color=color,
             anchor="w"
-        ).pack(anchor="w", padx=14, pady=(0, 8))
+        ).pack(anchor="w", padx=14, pady=(0, 9))
 
 
-def cambiar_sonido_libre(indice, etiqueta):
-    instrumento_libre.cambiar_sonido(indice, ETIQUETA_A_SONIDO.get(etiqueta, "DO"))
-    guardar_instrumento_libre()
+def abrir_teclado_sonidos(indice):
+    """
+    Teclado para elegir el sonido de una ranura.
+
+    Antes era un menú desplegable. Un teclado se entiende sin leer nada
+    y se atina con el mouse mucho más rápido.
+    """
+    if not (0 <= indice < len(instrumento_libre.ranuras)):
+        return
+
+    # ---- medidas del teclado ----
+
+    ANCHO_BLANCA = 62
+    ALTO_BLANCA = 200
+    ANCHO_NEGRA = 40
+    ALTO_NEGRA = 126
+
+    blancas = ["DO", "RE", "MI", "FA", "SOL", "LA", "SI"]
+
+    # Después de cuáles teclas blancas viene una negra.
+    # MI y SI no tienen: por eso el piano se ve agrupado en 2 y 3.
+    lleva_negra = [True, True, False, True, True, True, False]
+
+    ancho_teclado = len(blancas) * ANCHO_BLANCA
+
+    ventana = ctk.CTkToplevel(app)
+    ventana.title("Elegir sonido")
+    ventana.geometry(f"{ancho_teclado + 90}x{ALTO_BLANCA + 250}")
+    ventana.configure(fg_color=NEGRO)
+    ventana.resizable(False, False)
+    ventana.transient(app)
+    ventana.grab_set()
+
+    ctk.CTkLabel(
+        ventana,
+        text=f"Sonido del gesto {indice + 1}",
+        font=("Montserrat", 26, "bold"),
+        text_color=BLANCO
+    ).pack(pady=(20, 2))
+
+    ctk.CTkLabel(
+        ventana,
+        text=traducir("Toca una tecla para escucharla y asignarla."),
+        font=("Montserrat", 15),
+        text_color=GRIS
+    ).pack(pady=(0, 18))
+
+    actual = instrumento_libre.ranuras[indice]["sonido"]
+
+    def elegir(clave):
+        instrumento_libre.cambiar_sonido(indice, clave)
+        motor_notas.tocar_notas(SONIDOS_LIBRES[clave]["notas"])
+
+        dibujar_lista_libre()
+        guardar_instrumento_libre()
+
+        ventana.destroy()
+
+    # Las teclas se colocan con place(), y place() no le avisa al marco
+    # cuánto espacio necesita. Sin estas dos medidas el marco se queda
+    # con su tamaño por omisión y el teclado sale cortado a la mitad.
+    teclado = ctk.CTkFrame(
+        ventana,
+        fg_color="transparent",
+        width=ancho_teclado,
+        height=ALTO_BLANCA
+    )
+
+    teclado.pack()
+    teclado.pack_propagate(False)
+
+    # ---- teclas blancas ----
+
+    for posicion, nombre in enumerate(blancas):
+
+        clave = nombre
+
+        # Un punto en las teclas que sí mueven un relevador del piano.
+        etiqueta = clave if clave in RELEVADOR_POR_NOTA else f"{clave}\n·"
+
+        ctk.CTkButton(
+            teclado,
+            text=etiqueta,
+            width=ANCHO_BLANCA - 3,
+            height=ALTO_BLANCA,
+            corner_radius=6,
+            fg_color=AZUL if clave == actual else "#F2F2F2",
+            hover_color=MORADO,
+            text_color=BLANCO if clave == actual else GRIS4,
+            font=("Montserrat", 14, "bold"),
+            anchor="s",
+            command=lambda c=clave: elegir(c)
+        ).place(x=posicion * ANCHO_BLANCA, y=0)
+
+    # ---- teclas negras, encima y corridas a la derecha ----
+
+    for posicion, nombre in enumerate(blancas):
+
+        if not lleva_negra[posicion]:
+            continue
+
+        clave = f"{nombre}#"
+
+        # Los sostenidos que no tienen relevador se ven apagados.
+        tiene_piano = clave in RELEVADOR_POR_NOTA
+
+        ctk.CTkButton(
+            teclado,
+            text=clave,
+            width=ANCHO_NEGRA,
+            height=ALTO_NEGRA,
+            corner_radius=4,
+            fg_color=MORADO if clave == actual else NEGRO2,
+            hover_color=MORADO2,
+            text_color=BLANCO if tiene_piano else "#6A6A6A",
+            font=("Montserrat", 11, "bold"),
+            anchor="s",
+            command=lambda c=clave: elegir(c)
+        ).place(
+            x=posicion * ANCHO_BLANCA + ANCHO_BLANCA - ANCHO_NEGRA // 2,
+            y=0
+        )
+
+    ctk.CTkLabel(
+        ventana,
+        text="Las notas en gris solo suenan en la computadora:\n"
+             "el piano físico tiene ocho teclas.",
+        font=("Montserrat", 12),
+        text_color=GRIS
+    ).pack(pady=(10, 0))
+
+    ctk.CTkButton(
+        ventana,
+        text="Cancelar",
+        width=170,
+        height=42,
+        fg_color=GRIS3,
+        hover_color=ROJOOS,
+        font=("Montserrat", 15, "bold"),
+        command=ventana.destroy
+    ).pack(pady=22)
+
+    traducir_ventana(ventana)
 
 
 def agregar_sonido_libre():
     if len(instrumento_libre.ranuras) >= 8:
-        libre_feedback.configure(
-            text="Ocho sonidos es el máximo.",
-            text_color="#FF9F43"
+        poner_estado_libre(
+            "Ocho sonidos es el máximo.",
+            NARANJA
         )
         return
 
@@ -3559,12 +5245,6 @@ def quitar_sonido_libre(indice):
     dibujar_lista_libre()
     guardar_instrumento_libre()
 
-
-
-def borrar_gesto_libre(indice):
-    instrumento_libre.borrar_gesto(indice)
-    dibujar_lista_libre()
-    guardar_instrumento_libre()
 
 
 def guardar_instrumento_libre():
@@ -3593,9 +5273,9 @@ def iniciar_grabacion_gesto(indice):
     global cuenta_regresiva_libre
 
     if not detector.calibrado:
-        libre_feedback.configure(
-            text="Espera a que termine la calibración.",
-            text_color="#FF9F43"
+        poner_estado_libre(
+            "Espera a que termine la calibración.",
+            NARANJA
         )
         return
 
@@ -3616,10 +5296,12 @@ def contar_para_grabar(indice):
     global grabando_indice
     global cuenta_regresiva_libre
 
+    marcar_fila_libre(indice, "grabando")
+
     if cuenta_regresiva_libre > 0:
-        libre_feedback.configure(
-            text=f"Prepara tu gesto...  {cuenta_regresiva_libre}",
-            text_color=MORADO
+        poner_estado_libre(
+            f"Prepara tu gesto...   {cuenta_regresiva_libre}",
+            MORADO
         )
 
         cuenta_regresiva_libre -= 1
@@ -3629,10 +5311,7 @@ def contar_para_grabar(indice):
 
     grabando_indice = indice
 
-    libre_feedback.configure(
-        text="🎬 ¡Mantén el gesto!",
-        text_color=AZUL
-    )
+    poner_estado_libre("🎬 ¡Mantén el gesto!", AZUL)
 
 
 def guardar_muestra_gesto(medicion):
@@ -3672,7 +5351,8 @@ def terminar_grabacion_gesto():
     sirve, motivo = instrumento_libre.revisar_gesto(promedio, indice)
 
     if not sirve:
-        libre_feedback.configure(text=f"✖ {motivo}", text_color="#FF9F43")
+        marcar_fila_libre(None)
+        poner_estado_libre(f"✖ {motivo}", NARANJA)
         return
 
     instrumento_libre.guardar_gesto(indice, promedio)
@@ -3680,9 +5360,15 @@ def terminar_grabacion_gesto():
     dibujar_lista_libre()
     guardar_instrumento_libre()
 
-    libre_feedback.configure(
-        text=f"✓ Guardado: {instrumento_libre.ranuras[indice]['texto']}",
-        text_color=AZUL
+    registrar_evento(
+        "Gesto personalizado",
+        f"Movimiento propio ({instrumento_libre.ranuras[indice]['texto']}) "
+        f"asignado a la nota {instrumento_libre.ranuras[indice]['sonido']}"
+    )
+
+    poner_estado_libre(
+        f"✓ Guardado: {instrumento_libre.ranuras[indice]['texto']}",
+        VERDE
     )
 
 
@@ -3701,9 +5387,8 @@ def procesar_modo_libre(medicion):
     # Volvió al reposo: se libera el sonido para poder repetirlo.
     if indice is None:
         if instrumento_libre.ultimo_sonando is not None:
-            libre_feedback.configure(
-
-            )
+            marcar_fila_libre(None)
+            poner_estado_libre("Haz uno de tus gestos.", GRIS)
 
         instrumento_libre.ultimo_sonando = None
         return
@@ -3719,9 +5404,11 @@ def procesar_modo_libre(medicion):
 
     motor_notas.tocar_notas(sonido["notas"])
 
-    libre_feedback.configure(
-        text=f"{sonido['etiqueta']}   ←   {ranura['texto']}",
-        text_color=AZUL
+    marcar_fila_libre(indice, "sonando")
+
+    poner_estado_libre(
+        f"{sonido['etiqueta']}   ←   {ranura['texto']}",
+        AZUL
     )
 
     if "estado_nota" in globals():
@@ -3731,12 +5418,13 @@ def procesar_modo_libre(medicion):
 ctk.CTkButton(
     botones_libre,
     text="➕ Agregar sonido",
-    height=34,
-    fg_color="#2B2B2B",
+    height=42,
+    corner_radius=12,
+    fg_color=AZUL,
     hover_color=MORADO,
-    font=("Montserrat", 13, "bold"),
+    font=("Montserrat", 15, "bold"),
     command=agregar_sonido_libre
-).pack(side="left", expand=True, fill="x", padx=(0, 4))
+).pack(fill="x")
 
 dibujar_lista_libre()
 
@@ -3757,13 +5445,15 @@ def activar_modo_terapia():
     info_sesion.pack(side="right", fill="both", padx=20)
 
     btn_terapia.configure(fg_color=AZUL)
-    btn_cancion.configure(fg_color="#222222")
-    btn_libre.configure(fg_color="#222222")
+    btn_cancion.configure(fg_color=GRIS2)
+    btn_libre.configure(fg_color=GRIS2)
 
-    modo_actual.configure(text="🧠 Modo Terapia")
+    mostrar_sonido_terapia(True)
+
+    modo_actual.configure(text=traducir("🧠 Modo Terapia"))
 
     instruccion_label.configure(
-        text="INSTRUCCIÓN: Haz una expresión clara y mantenla unos instantes."
+        text=traducir("INSTRUCCIÓN: Haz una expresión clara y mantenla unos instantes.")
     )
 
 
@@ -3776,11 +5466,13 @@ def activar_modo_cancion():
     panel_libre.pack_forget()
     panel_cancion.pack(side="right", fill="both", padx=20)
 
-    btn_terapia.configure(fg_color="#222222")
+    btn_terapia.configure(fg_color=GRIS2)
     btn_cancion.configure(fg_color=AZUL)
-    btn_libre.configure(fg_color="#222222")
+    btn_libre.configure(fg_color=GRIS2)
 
-    modo_actual.configure(text="🎼 Canción Guiada")
+    mostrar_sonido_terapia(False)
+
+    modo_actual.configure(text=traducir("🎼 Canción Guiada"))
 
     # Siempre se entra por el menú de selección.
     mostrar_menu_canciones()
@@ -3803,11 +5495,13 @@ def activar_modo_libre():
     panel_cancion.pack_forget()
     panel_libre.pack(side="right", fill="both", padx=20)
 
-    btn_terapia.configure(fg_color="#222222")
-    btn_cancion.configure(fg_color="#222222")
+    btn_terapia.configure(fg_color=GRIS2)
+    btn_cancion.configure(fg_color=GRIS2)
     btn_libre.configure(fg_color=AZUL)
 
-    modo_actual.configure(text="🎛 Modo Libre")
+    mostrar_sonido_terapia(False)
+
+    modo_actual.configure(text=traducir("🎛 Modo Libre"))
 
     # Recuperamos el instrumento que esta persona ya había armado.
     if usuario_actual is not None:
@@ -3819,10 +5513,27 @@ def activar_modo_libre():
     dibujar_lista_libre()
 
     if not detector.calibrado:
-        libre_feedback.configure(
-            text="Espera a que termine la calibración.",
-            text_color="#FF9F43"
+        poner_estado_libre(
+            "Espera a que termine la calibración.",
+            NARANJA
         )
+
+
+def aplicar_idioma():
+    """Aplica el idioma a widgets actuales y a los paneles dinámicos."""
+    traducir_ventana(app)
+    try: recargar_tarjetas_usuarios()
+    except Exception: pass
+    try: dibujar_lista_libre()
+    except Exception: pass
+    try: construir_menu_canciones()
+    except Exception: pass
+    try: actualizar_panel_cancion()
+    except Exception: pass
+    try:
+        actualizar_estadisticas_perfil()
+        actualizar_comentarios_perfil()
+    except Exception: pass
 
 
 btn_terapia.configure(command=activar_modo_terapia)
@@ -3832,10 +5543,10 @@ btn_libre.configure(command=activar_modo_libre)
 # Botón para volver al menú desde la pantalla de tocar.
 ctk.CTkButton(
     barra_superior,
-    text="← Canciones",
+    text=traducir("← Canciones"),
     width=110,
     height=30,
-    fg_color="#2B2B2B",
+    fg_color=GRIS2,
     hover_color=MORADO,
     font=("Montserrat", 12, "bold"),
     command=mostrar_menu_canciones
@@ -3843,7 +5554,7 @@ ctk.CTkButton(
 
 ctk.CTkButton(
     controles_cancion,
-    text="▶ INICIAR",
+    text=traducir("▶ INICIAR"),
     width=125,
     height=40,
     fg_color=AZUL,
@@ -3854,10 +5565,10 @@ ctk.CTkButton(
 
 ctk.CTkButton(
     controles_cancion,
-    text="⏸ PAUSA",
+    text=traducir("⏸ PAUSA"),
     width=125,
     height=40,
-    fg_color="#2B2B2B",
+    fg_color=GRIS2,
     hover_color=MORADO,
     font=("Montserrat", 15, "bold"),
     command=pausar_cancion
@@ -3865,10 +5576,10 @@ ctk.CTkButton(
 
 ctk.CTkButton(
     controles_cancion,
-    text="↻ REINICIAR",
+    text=traducir("↻ REINICIAR"),
     width=125,
     height=40,
-    fg_color="#2B2B2B",
+    fg_color=GRIS2,
     hover_color=MORADO,
     font=("Montserrat", 15, "bold"),
     command=reiniciar_cancion
@@ -3981,14 +5692,6 @@ MEDICIONES_LEGIBLES = {
     }
 }
 
-NOTAS_POR_EMOCION = {
-    "ABURRIMIENTO": "DO",
-    "SORPRESA": "RE",
-    "IRA": "MI",
-    "TRISTEZA": "FA",
-    "ALEGRÍA": "SOL"
-}
-
 COLORES_POR_EMOCION = {
     "ABURRIMIENTO": MORADO2,
     "SORPRESA": AZUL,
@@ -4048,116 +5751,6 @@ def porcentaje_medicion(clave, valor, escalas=None):
     proporcion = (valor - minimo) / (maximo - minimo)
 
     return max(0.0, min(1.0, proporcion))
-
-
-def etiqueta_medicion(clave, proporcion):
-    """Devuelve la palabra que describe el nivel de la medición."""
-    info = MEDICIONES_LEGIBLES.get(clave)
-
-    if info is None:
-        return ""
-
-    niveles = info["niveles"]
-    indice = int(proporcion * len(niveles))
-
-    return niveles[min(indice, len(niveles) - 1)]
-
-
-def color_medicion(proporcion):
-    if proporcion >= 0.75:
-        return MORADO
-    if proporcion >= 0.35:
-        return AZUL
-    return "#4F6B85"
-
-
-def comparar_humano(clave, actual, anterior, escalas=None):
-    """Explica con palabras si la persona hizo más o menos que la vez pasada."""
-    if anterior is None:
-        return "Primera vez que se mide esta expresión.", GRIS
-
-    info = MEDICIONES_LEGIBLES.get(clave)
-
-    if info is None:
-        return "", GRIS
-
-    if escalas and clave in escalas:
-        minimo, maximo = escalas[clave]
-    else:
-        minimo, maximo = info["escala"]
-
-    rango = max(maximo - minimo, 1e-9)
-    diferencia = (actual - anterior) / rango
-
-    if abs(diferencia) < 0.05:
-        return "Casi igual que la vez anterior.", GRIS
-
-    palabra = "más" if diferencia > 0 else "menos"
-    intensidad = "bastante" if abs(diferencia) > 0.20 else "un poco"
-    color = AZUL if diferencia > 0 else MORADO
-
-    return f"{intensidad.capitalize()} {palabra} que la vez anterior.", color
-
-
-def barra_medicion(padre, clave, valor, escalas=None, mostrar_numero=False):
-    """Dibuja una fila: icono + título + palabra + barra de progreso."""
-    info = MEDICIONES_LEGIBLES.get(clave)
-
-    if info is None:
-        return
-
-    proporcion = porcentaje_medicion(clave, valor, escalas)
-    palabra = etiqueta_medicion(clave, proporcion)
-    color = color_medicion(proporcion)
-
-    fila = ctk.CTkFrame(padre, fg_color="transparent")
-    fila.pack(fill="x", padx=15, pady=5)
-
-    encabezado = ctk.CTkFrame(fila, fg_color="transparent")
-    encabezado.pack(fill="x")
-
-    ctk.CTkLabel(
-        encabezado,
-        text=f"{info['icono']}  {info['titulo']}",
-        font=("Montserrat", 15),
-        text_color=BLANCO,
-        anchor="w"
-    ).pack(side="left")
-
-    texto_derecha = palabra
-
-    if mostrar_numero:
-        texto_derecha = f"{palabra}   ({valor:.5f})"
-
-    ctk.CTkLabel(
-        encabezado,
-        text=texto_derecha,
-        font=("Montserrat", 15, "bold"),
-        text_color=color,
-        anchor="e"
-    ).pack(side="right")
-
-    # Barra: un riel gris y un relleno de color encima.
-    riel = ctk.CTkFrame(
-        fila,
-        fg_color="#2B2B2B",
-        height=12,
-        corner_radius=6
-    )
-    riel.pack(fill="x", pady=(4, 0))
-    riel.pack_propagate(False)
-
-    relleno = ctk.CTkFrame(
-        riel,
-        fg_color=color,
-        corner_radius=6
-    )
-    relleno.place(
-        relx=0,
-        rely=0,
-        relwidth=max(proporcion, 0.02),
-        relheight=1
-    )
 
 
 # ==========================================
@@ -4248,7 +5841,7 @@ def dibujar_grafica_progreso(event=None):
             y,
             margen_izq + area_ancho,
             y,
-            fill="#2B2B2B"
+            fill=GRIS2
         )
 
         canvas.create_text(
@@ -4334,7 +5927,7 @@ def dibujar_grafica_progreso(event=None):
         margen_sup + area_alto,
         margen_izq + area_ancho,
         margen_sup + area_alto,
-        fill="#3A3A3A"
+        fill=GRIS3
     )
 
     unidad = {
@@ -4354,7 +5947,12 @@ def dibujar_grafica_progreso(event=None):
 
 def cambiar_metrica_grafica(valor):
     global metrica_grafica
-    metrica_grafica = valor
+
+    # El selector puede venir traducido ("Expressions"). Guardamos
+    # siempre el nombre en español, que es con el que compara la
+    # gráfica más abajo.
+    metrica_grafica = TRADUCCION_ES.get(valor.strip(), valor)
+
     dibujar_grafica_progreso()
 
 
@@ -4370,9 +5968,13 @@ def actualizar_estadisticas_perfil():
 
     edad = str(datos.get("edad", "")).strip()
 
-    edad_label.configure(
-        text=f"Edad: {edad} años" if edad else "Edad: sin registrar"
-    )
+    if edad:
+        edad_label.configure(
+            text=f"Age: {edad} years" if IDIOMA == "en"
+                 else f"Edad: {edad} años"
+        )
+    else:
+        edad_label.configure(text=traducir("Edad: sin registrar"))
 
     motivo = str(datos.get("motivo", "")).strip()
 
@@ -4383,29 +5985,33 @@ def actualizar_estadisticas_perfil():
 
     minutos = datos.get("tiempo_total", 0) // 60
 
+    # Estas cinco líneas se arman con el número pegado al texto, así
+    # que el barrido de traducción no las alcanza: hay que armarlas
+    # ya traducidas. La etiqueta se traduce y el número se le pega.
     tiempo_total_label.configure(
-        text=f"Tiempo total: {minutos} min"
+        text=f"{traducir('Tiempo total:')} {minutos} min"
     )
 
     sesiones_label.configure(
-        text=f"Sesiones realizadas: {datos.get('sesiones', 0)}"
+        text=f"{traducir('Sesiones realizadas:')} {datos.get('sesiones', 0)}"
     )
 
     expresiones_label.configure(
-        text=f"Expresiones registradas: {datos.get('expresiones', 0)}"
+        text=f"{traducir('Expresiones registradas:')} "
+             f"{datos.get('expresiones', 0)}"
     )
 
     notas_label.configure(
-        text=f"Notas detectadas: {datos.get('notas', 0)}"
+        text=f"{traducir('Notas detectadas:')} {datos.get('notas', 0)}"
     )
 
     ultima = datos.get("ultima_sesion", "")
 
     ultima_label.configure(
         text=(
-            f"Última sesión: {ultima}"
+            f"{traducir('Última sesión:')} {ultima}"
             if ultima
-            else "Última sesión: Sin sesiones"
+            else f"{traducir('Última sesión:')} {traducir('Sin sesiones')}"
         )
     )
 
@@ -4483,6 +6089,719 @@ def nivel_logro(clave, valor, escalas):
     return proporcion, niveles[indice]
 
 
+# ==========================================
+# REPORTE PDF PARA LA TERAPEUTA
+# ==========================================
+
+# Este reporte NO crea otra base de datos.
+# Lee directamente el historial que TALAT ya guarda en usuarios.json.
+
+MOVIMIENTOS_REPORTE = {
+    "ALEGRÍA": ("Sonrisa", "Smile"),
+    "SORPRESA": ("Apertura de boca y elevación de cejas",
+                 "Mouth opening and eyebrow elevation"),
+    "IRA": ("Fruncimiento del ceño", "Frowning"),
+    "TRISTEZA": ("Movimiento de las comisuras", "Mouth-corner movement"),
+    "ABURRIMIENTO": ("Entrecierre de ojos", "Eye narrowing")
+}
+
+
+def _texto_reporte(espanol, ingles):
+    return ingles if IDIOMA == "en" else espanol
+
+
+def _nombre_movimiento_reporte(emocion):
+    nombres = MOVIMIENTOS_REPORTE.get(emocion)
+    return _texto_reporte(*nombres) if nombres else traducir(emocion).capitalize()
+
+
+def _abrir_archivo_generado(ruta):
+    try:
+        import subprocess
+        import sys
+
+        if sys.platform.startswith("win"):
+            os.startfile(ruta)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", ruta])
+        else:
+            subprocess.Popen(["xdg-open", ruta])
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _sesiones_validas(datos):
+    return [
+        sesion for sesion in datos.get("historial_sesiones", [])
+        if isinstance(sesion, dict)
+    ]
+
+
+def _expresiones_de_sesion(sesion):
+    expresiones = sesion.get("expresiones", [])
+    return expresiones if isinstance(expresiones, list) else []
+
+
+def _duracion_minutos(sesion):
+    try:
+        return round(float(sesion.get("duracion_segundos", 0) or 0) / 60.0, 1)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fecha_corta(sesion):
+    fecha = str(sesion.get("fecha", "") or "")
+    if len(fecha) >= 10:
+        # Guardada como YYYY-MM-DD HH:MM.
+        yyyy, mm, dd = fecha[:10].split("-")
+        return f"{dd}/{mm}" if IDIOMA == "es" else f"{mm}/{dd}"
+    return "—"
+
+
+def _conteo_movimientos(datos):
+    conteo = {emocion: 0 for emocion in MOVIMIENTOS_REPORTE}
+
+    for sesion in _sesiones_validas(datos):
+        for registro in _expresiones_de_sesion(sesion):
+            if not isinstance(registro, dict):
+                continue
+            emocion = registro.get("emocion")
+            if emocion in conteo:
+                conteo[emocion] += 1
+
+    return conteo
+
+
+def _calidad_registro(registro, escalas):
+    """
+    Convierte las mediciones útiles de una expresión a 0-100.
+
+    Usa las mismas reglas que la pantalla de estadísticas:
+    LO_QUE_IMPORTA decide qué mediciones mirar y LOGRO_POR_MEDICION
+    indica si una medición aumenta o disminuye cuando el gesto se marca.
+    """
+    emocion = registro.get("emocion")
+    claves = LO_QUE_IMPORTA.get(emocion, [])
+    valores = []
+
+    for clave in claves:
+        if clave not in registro:
+            continue
+
+        valor = porcentaje_medicion(clave, registro[clave], escalas)
+
+        if LOGRO_POR_MEDICION.get(clave, {}).get("invertida"):
+            valor = 1.0 - valor
+
+        valores.append(max(0.0, min(1.0, valor)))
+
+    if not valores:
+        return None
+
+    return sum(valores) / len(valores) * 100.0
+
+
+def _calidad_por_movimiento(datos):
+    historial = _sesiones_validas(datos)
+    escalas = escalas_del_usuario(historial)
+    acumulado = {emocion: [] for emocion in MOVIMIENTOS_REPORTE}
+
+    for sesion in historial:
+        for registro in _expresiones_de_sesion(sesion):
+            if not isinstance(registro, dict):
+                continue
+
+            emocion = registro.get("emocion")
+            if emocion not in acumulado:
+                continue
+
+            calidad = _calidad_registro(registro, escalas)
+            if calidad is not None:
+                acumulado[emocion].append(calidad)
+
+    return {
+        emocion: round(sum(valores) / len(valores), 1) if valores else None
+        for emocion, valores in acumulado.items()
+    }
+
+
+def _calidad_bloque_sesiones(sesiones, escalas):
+    valores = []
+
+    for sesion in sesiones:
+        for registro in _expresiones_de_sesion(sesion):
+            if not isinstance(registro, dict):
+                continue
+            calidad = _calidad_registro(registro, escalas)
+            if calidad is not None:
+                valores.append(calidad)
+
+    if not valores:
+        return None
+
+    return sum(valores) / len(valores)
+
+
+def _indicadores_terapeuta(datos):
+    sesiones = _sesiones_validas(datos)
+    conteo = _conteo_movimientos(datos)
+
+    total_expresiones = sum(
+        int(s.get("total_expresiones", len(_expresiones_de_sesion(s))) or 0)
+        for s in sesiones
+    )
+    total_minutos = sum(_duracion_minutos(s) for s in sesiones)
+
+    promedio_exp = total_expresiones / len(sesiones) if sesiones else 0
+    promedio_min = total_minutos / len(sesiones) if sesiones else 0
+
+    practicados = [(e, n) for e, n in conteo.items() if n > 0]
+    if practicados:
+        emocion_favorita, cantidad_favorita = max(practicados, key=lambda x: x[1])
+        movimiento_favorito = (
+            f"{_nombre_movimiento_reporte(emocion_favorita)} ({cantidad_favorita})"
+        )
+    else:
+        movimiento_favorito = "—"
+
+    cambio = None
+    if len(sesiones) >= 2:
+        escalas = escalas_del_usuario(sesiones)
+        cantidad_bloque = min(3, max(1, len(sesiones) // 2))
+        primeras = sesiones[:cantidad_bloque]
+        recientes = sesiones[-cantidad_bloque:]
+
+        calidad_inicio = _calidad_bloque_sesiones(primeras, escalas)
+        calidad_actual = _calidad_bloque_sesiones(recientes, escalas)
+
+        if calidad_inicio is not None and calidad_actual is not None:
+            cambio = round(calidad_actual - calidad_inicio, 1)
+
+    return {
+        "promedio_exp": round(promedio_exp, 1),
+        "promedio_min": round(promedio_min, 1),
+        "movimiento_favorito": movimiento_favorito,
+        "cambio": cambio
+    }
+
+
+def _grafica_barras_sesiones(datos):
+    """Gráfica: expresiones logradas en las últimas 10 sesiones."""
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.graphics.charts.textlabels import Label
+    from reportlab.lib import colors
+
+    sesiones = _sesiones_validas(datos)[-10:]
+    valores = [
+        int(s.get("total_expresiones", len(_expresiones_de_sesion(s))) or 0)
+        for s in sesiones
+    ]
+    etiquetas = [_fecha_corta(s) for s in sesiones]
+
+    dibujo = Drawing(500, 210)
+
+    if not sesiones:
+        return dibujo
+
+    grafica = VerticalBarChart()
+    grafica.x = 42
+    grafica.y = 35
+    grafica.height = 135
+    grafica.width = 425
+    grafica.data = [valores]
+    grafica.categoryAxis.categoryNames = etiquetas
+    grafica.categoryAxis.labels.fontName = "Helvetica"
+    grafica.categoryAxis.labels.fontSize = 8
+    grafica.valueAxis.valueMin = 0
+    grafica.valueAxis.valueMax = max(5, max(valores) * 1.2)
+    grafica.valueAxis.valueStep = max(1, int(grafica.valueAxis.valueMax / 5))
+    grafica.valueAxis.labels.fontName = "Helvetica"
+    grafica.valueAxis.labels.fontSize = 8
+    grafica.bars[0].fillColor = colors.HexColor("#3B9DFF")
+    grafica.barWidth = 16
+    dibujo.add(grafica)
+
+    etiqueta = Label()
+    etiqueta.setOrigin(250, 190)
+    etiqueta.setText(
+        _texto_reporte(
+            "Expresiones logradas por sesión",
+            "Expressions completed per session"
+        )
+    )
+    etiqueta.fontName = "Helvetica-Bold"
+    etiqueta.fontSize = 11
+    etiqueta.textAnchor = "middle"
+    dibujo.add(etiqueta)
+
+    return dibujo
+
+
+def _grafica_calidad_movimientos(datos):
+    """
+    Gráfica: qué tan marcado fue cada movimiento, de 0 a 100.
+
+    No muestra números crudos de MediaPipe. Resume las mediciones
+    faciales que ya usa TALAT para cada expresión.
+    """
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.charts.barcharts import HorizontalBarChart
+    from reportlab.graphics.charts.textlabels import Label
+    from reportlab.lib import colors
+
+    calidad = _calidad_por_movimiento(datos)
+
+    emociones = [
+        e for e in MOVIMIENTOS_REPORTE
+        if calidad.get(e) is not None
+    ]
+
+    dibujo = Drawing(500, 225)
+
+    if not emociones:
+        return dibujo
+
+    valores = [calidad[e] for e in emociones]
+    nombres = [_nombre_movimiento_reporte(e) for e in emociones]
+
+    grafica = HorizontalBarChart()
+    grafica.x = 165
+    grafica.y = 32
+    grafica.height = 145
+    grafica.width = 300
+    grafica.data = [valores]
+    grafica.categoryAxis.categoryNames = nombres
+    grafica.categoryAxis.labels.fontName = "Helvetica"
+    grafica.categoryAxis.labels.fontSize = 7.5
+    grafica.valueAxis.valueMin = 0
+    grafica.valueAxis.valueMax = 100
+    grafica.valueAxis.valueStep = 20
+    grafica.valueAxis.labels.fontName = "Helvetica"
+    grafica.valueAxis.labels.fontSize = 8
+    grafica.bars[0].fillColor = colors.HexColor("#9B4DFF")
+    dibujo.add(grafica)
+
+    etiqueta = Label()
+    etiqueta.setOrigin(250, 205)
+    etiqueta.setText(
+        _texto_reporte(
+            "Qué tan marcado fue cada movimiento (0–100)",
+            "How pronounced each movement was (0–100)"
+        )
+    )
+    etiqueta.fontName = "Helvetica-Bold"
+    etiqueta.fontSize = 11
+    etiqueta.textAnchor = "middle"
+    dibujo.add(etiqueta)
+
+    return dibujo
+
+
+def construir_reporte_pdf(nombre):
+    datos = usuarios_db.get(nombre)
+
+    if datos is None:
+        return False, traducir("No se encontró el usuario.")
+
+    sesiones = _sesiones_validas(datos)
+    if not sesiones:
+        return False, traducir("Todavía no hay sesiones de esta persona.")
+
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+            KeepTogether
+        )
+    except ImportError:
+        return False, "Falta reportlab (pip install reportlab)"
+
+    try:
+        limpio = "".join(
+            c for c in nombre if c.isalnum() or c in " -_"
+        ).strip().replace(" ", "_")
+
+        archivo = (
+            f"reporte_talat_{limpio}_"
+            f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}.pdf"
+        )
+        ruta = os.path.abspath(archivo)
+
+        documento = SimpleDocTemplate(
+            ruta,
+            pagesize=letter,
+            rightMargin=1.35 * cm,
+            leftMargin=1.35 * cm,
+            topMargin=1.25 * cm,
+            bottomMargin=1.25 * cm
+        )
+
+        estilos = getSampleStyleSheet()
+
+        estilo_titulo = ParagraphStyle(
+            "TalatTitulo",
+            parent=estilos["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=20,
+            leading=23,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#3B9DFF"),
+            spaceAfter=5
+        )
+
+        estilo_subtitulo = ParagraphStyle(
+            "TalatSubtitulo",
+            parent=estilos["Normal"],
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=13,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#666666"),
+            spaceAfter=10
+        )
+
+        estilo_seccion = ParagraphStyle(
+            "TalatSeccion",
+            parent=estilos["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=12.5,
+            leading=15,
+            textColor=colors.HexColor("#5D2AA6"),
+            spaceBefore=8,
+            spaceAfter=5
+        )
+
+        estilo_normal = ParagraphStyle(
+            "TalatNormal",
+            parent=estilos["Normal"],
+            fontName="Helvetica",
+            fontSize=9.5,
+            leading=13
+        )
+
+        elementos = []
+
+        # ---------------- ENCABEZADO ----------------
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "REPORTE DE SEGUIMIENTO TALAT",
+                "TALAT FOLLOW-UP REPORT"
+            ),
+            estilo_titulo
+        ))
+
+        edad = str(datos.get("edad", "")).strip()
+        fecha_impresion = datetime.now().strftime(
+            "%d/%m/%Y" if IDIOMA == "es" else "%m/%d/%Y"
+        )
+
+        linea = nombre
+        if edad:
+            linea += _texto_reporte(
+                f" · {edad} años",
+                f" · {edad} years old"
+            )
+        linea += _texto_reporte(
+            f"<br/>Generado el {fecha_impresion}",
+            f"<br/>Generated on {fecha_impresion}"
+        )
+        elementos.append(Paragraph(linea, estilo_subtitulo))
+
+        motivo = str(datos.get("motivo", "")).strip()
+        if motivo:
+            elementos.append(Paragraph(
+                _texto_reporte(
+                    f"<b>Motivo registrado:</b> {motivo}",
+                    f"<b>Recorded reason:</b> {motivo}"
+                ),
+                estilo_normal
+            ))
+            elementos.append(Spacer(1, 5))
+
+        # ---------------- INDICADORES ----------------
+        indicadores = _indicadores_terapeuta(datos)
+
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "INDICADORES DE ACTIVIDAD",
+                "ACTIVITY INDICATORS"
+            ),
+            estilo_seccion
+        ))
+
+        cambio = indicadores["cambio"]
+        if cambio is None:
+            cambio_texto = _texto_reporte(
+                "Aún no hay suficientes mediciones para comparar",
+                "Not enough measurements to compare yet"
+            )
+        elif cambio > 2:
+            cambio_texto = _texto_reporte(
+                f"+{cambio:.1f} puntos en movimientos recientes",
+                f"+{cambio:.1f} points in recent movements"
+            )
+        elif cambio < -2:
+            cambio_texto = _texto_reporte(
+                f"{cambio:.1f} puntos respecto al inicio",
+                f"{cambio:.1f} points compared with the beginning"
+            )
+        else:
+            cambio_texto = _texto_reporte(
+                "Se mantiene similar al inicio",
+                "Similar to the beginning"
+            )
+
+        indicadores_tabla = [
+            [
+                _texto_reporte("Sesiones", "Sessions"),
+                _texto_reporte("Tiempo total", "Total time"),
+                _texto_reporte("Promedio por sesión", "Average per session"),
+                _texto_reporte("Duración promedio", "Average duration")
+            ],
+            [
+                str(len(sesiones)),
+                f"{sum(_duracion_minutos(s) for s in sesiones):.1f} min",
+                f"{indicadores['promedio_exp']:.1f} "
+                + _texto_reporte("expresiones", "expressions"),
+                f"{indicadores['promedio_min']:.1f} min"
+            ]
+        ]
+
+        tabla = Table(
+            indicadores_tabla,
+            colWidths=[4.1 * cm, 4.1 * cm, 4.1 * cm, 4.1 * cm]
+        )
+        tabla.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1A1A1A")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F4F4F4")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 1), (-1, 1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.3),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D0D0D0")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        elementos.append(tabla)
+        elementos.append(Spacer(1, 6))
+
+        detalles = Table([
+            [
+                Paragraph(
+                    "<b>" + _texto_reporte(
+                        "Movimiento más practicado:",
+                        "Most practiced movement:"
+                    ) + "</b><br/>" + indicadores["movimiento_favorito"],
+                    estilo_normal
+                ),
+                Paragraph(
+                    "<b>" + _texto_reporte(
+                        "Cambio observado:",
+                        "Observed change:"
+                    ) + "</b><br/>" + cambio_texto,
+                    estilo_normal
+                )
+            ]
+        ], colWidths=[8.2 * cm, 8.2 * cm])
+        detalles.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F7F7F7")),
+            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D0D0")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D0D0D0")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        elementos.append(detalles)
+
+        # ---------------- GRÁFICA 1 ----------------
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "PROGRESO POR SESIÓN",
+                "PROGRESS BY SESSION"
+            ),
+            estilo_seccion
+        ))
+        elementos.append(_grafica_barras_sesiones(datos))
+
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "La gráfica muestra cuántas expresiones fueron reconocidas en cada una "
+                "de las últimas sesiones. Sirve para observar participación y cantidad "
+                "de práctica, no para calificar a la persona.",
+                "The chart shows how many expressions were recognized in each recent "
+                "session. It reflects participation and amount of practice, not a grade."
+            ),
+            estilo_normal
+        ))
+
+        # ---------------- GRÁFICA 2 ----------------
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "CALIDAD DE LOS MOVIMIENTOS FACIALES",
+                "FACIAL MOVEMENT QUALITY"
+            ),
+            estilo_seccion
+        ))
+        elementos.append(_grafica_calidad_movimientos(datos))
+
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "El valor 0–100 resume qué tan marcado fue cada movimiento a partir "
+                "de las mediciones que TALAT ya utiliza. No son porcentajes médicos "
+                "ni un diagnóstico.",
+                "The 0–100 value summarizes how pronounced each movement was using "
+                "the measurements TALAT already analyzes. These are not medical "
+                "percentages or a diagnosis."
+            ),
+            estilo_normal
+        ))
+
+        # ---------------- ÚLTIMAS SESIONES ----------------
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "ÚLTIMAS SESIONES",
+                "RECENT SESSIONS"
+            ),
+            estilo_seccion
+        ))
+
+        historial_tabla = [[
+            _texto_reporte("Fecha", "Date"),
+            _texto_reporte("Duración", "Duration"),
+            _texto_reporte("Expresiones", "Expressions"),
+            _texto_reporte("Notas", "Notes")
+        ]]
+
+        for sesion in sesiones[-8:]:
+            historial_tabla.append([
+                _fecha_corta(sesion),
+                f"{_duracion_minutos(sesion):.1f} min",
+                str(sesion.get(
+                    "total_expresiones",
+                    len(_expresiones_de_sesion(sesion))
+                )),
+                str(sesion.get("total_notas", 0))
+            ])
+
+        historial = Table(
+            historial_tabla,
+            colWidths=[4.1 * cm, 4.1 * cm, 4.1 * cm, 4.1 * cm],
+            repeatRows=1
+        )
+        historial.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3B9DFF")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#D0D0D0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.white, colors.HexColor("#F4F4F4")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        elementos.append(historial)
+
+        # ---------------- NOTAS ----------------
+        elementos.append(Paragraph(
+            _texto_reporte(
+                "OBSERVACIONES DE LA TERAPEUTA",
+                "THERAPIST'S NOTES"
+            ),
+            estilo_seccion
+        ))
+
+        notas = Table(
+            [[""] for _ in range(5)],
+            colWidths=[16.4 * cm],
+            rowHeights=[0.62 * cm] * 5
+        )
+        notas.setStyle(TableStyle([
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#BFBFBF"))
+        ]))
+        elementos.append(notas)
+
+        def pie(canvas, doc):
+            canvas.saveState()
+            canvas.setFont("Helvetica", 7.5)
+            canvas.setFillColor(colors.HexColor("#777777"))
+            canvas.drawCentredString(
+                letter[0] / 2,
+                0.65 * cm,
+                _texto_reporte(
+                    "TALAT · Reporte de seguimiento de actividad",
+                    "TALAT · Activity follow-up report"
+                )
+            )
+            canvas.restoreState()
+
+        documento.build(
+            elementos,
+            onFirstPage=pie,
+            onLaterPages=pie
+        )
+
+        registrar_evento(
+            "Reporte generado",
+            f"Reporte PDF: {archivo}",
+            usuario=nombre
+        )
+
+        return True, ruta
+
+    except Exception as e:
+        print("No se pudo generar el PDF:", e)
+        return False, f"{traducir('No se pudo generar el archivo')} ({e})"
+
+
+def exportar_graficas_para_imprimir(nombre=None):
+    """
+    El botón existente sigue usando el mismo nombre de función.
+    No se crea ninguna base nueva: se genera un PDF desde usuarios.json.
+    """
+    persona = nombre or usuario_actual
+    titulo = traducir("Reporte PDF de TALAT")
+
+    if persona is None:
+        messagebox.showinfo(
+            titulo,
+            traducir("Primero abre el perfil de una persona.")
+        )
+        return
+
+    listo, resultado = construir_reporte_pdf(persona)
+
+    if not listo:
+        messagebox.showwarning(titulo, resultado)
+        return
+
+    abierto, motivo = _abrir_archivo_generado(resultado)
+
+    if abierto:
+        messagebox.showinfo(
+            titulo,
+            f"{traducir('Reporte generado correctamente.')}\n\n{resultado}"
+        )
+    else:
+        messagebox.showinfo(
+            titulo,
+            f"{traducir('El archivo se guardó aquí:')}\n\n{resultado}\n\n"
+            f"({traducir('No se pudo abrir solo')}: {motivo})"
+        )
+
+
 def barra_logro(padre, clave, valor, escalas):
     """Una pregunta en lenguaje normal, la respuesta y una barra."""
     info = LOGRO_POR_MEDICION.get(clave)
@@ -4497,7 +6816,7 @@ def barra_logro(padre, clave, valor, escalas):
     elif proporcion >= 0.33:
         color = AZUL
     else:
-        color = "#FF9F43"
+        color = NARANJA
 
     fila = ctk.CTkFrame(padre, fg_color="transparent")
     fila.pack(fill="x", padx=18, pady=5)
@@ -4521,7 +6840,7 @@ def barra_logro(padre, clave, valor, escalas):
         anchor="e"
     ).pack(side="right")
 
-    riel = ctk.CTkFrame(fila, fg_color="#2B2B2B", height=14, corner_radius=7)
+    riel = ctk.CTkFrame(fila, fg_color=GRIS2, height=14, corner_radius=7)
     riel.pack(fill="x", pady=(4, 0))
     riel.pack_propagate(False)
 
@@ -4545,7 +6864,7 @@ def mostrar_detalle_estadisticas():
     escalas = escalas_del_usuario(historial)
 
     ventana = ctk.CTkToplevel(app)
-    ventana.title(f"Cómo te ha ido - {usuario_actual}")
+    ventana.title(f"Cómo le ha ido - {usuario_actual}")
     ventana.geometry("900x700")
     ventana.configure(fg_color=NEGRO)
     ventana.transient(app)
@@ -4588,7 +6907,7 @@ def mostrar_detalle_estadisticas():
 
             indice_real = total_sesiones - numero + 1
 
-            bloque = ctk.CTkFrame(scroll, fg_color="#1A1A1A", corner_radius=18)
+            bloque = ctk.CTkFrame(scroll, fg_color=NEGRO2, corner_radius=18)
             bloque.pack(fill="x", pady=10, padx=5)
 
             expresiones = sesion.get("expresiones", [])
@@ -4651,7 +6970,7 @@ def mostrar_detalle_estadisticas():
 
             for emocion, registros in por_expresion.items():
 
-                tarjeta = ctk.CTkFrame(bloque, fg_color="#111111", corner_radius=14)
+                tarjeta = ctk.CTkFrame(bloque, fg_color=NEGRO, corner_radius=14)
                 tarjeta.pack(fill="x", padx=20, pady=8)
 
                 cabecera = ctk.CTkFrame(tarjeta, fg_color="transparent")
@@ -4702,7 +7021,7 @@ def mostrar_detalle_estadisticas():
                             color = "#4CF405"
                         else:
                             frase = "Esta vez te salió un poco menos marcado."
-                            color = "#FF9F43"
+                            color = NARANJA
 
                         ctk.CTkLabel(
                             tarjeta,
@@ -4718,7 +7037,7 @@ def mostrar_detalle_estadisticas():
                         text_color=GRIS
                     ).pack(anchor="w", padx=18, pady=(6, 12))
 
-            ctk.CTkFrame(bloque, height=8, fg_color="#1A1A1A").pack()
+            ctk.CTkFrame(bloque, height=8, fg_color=NEGRO2).pack()
 
     ctk.CTkButton(
         ventana,
@@ -4730,6 +7049,8 @@ def mostrar_detalle_estadisticas():
         font=("Montserrat", 16, "bold"),
         command=ventana.destroy
     ).pack(pady=(0, 18))
+
+    traducir_ventana(ventana)
 
 
 def actualizar_comentarios_perfil():
@@ -4824,7 +7145,7 @@ contenido_perfil.pack(
 
 ficha_personal = ctk.CTkFrame(
     contenido_scroll,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20
 )
 
@@ -4874,7 +7195,7 @@ motivo_label.pack(anchor="w", padx=20, pady=(2,18))
 
 estadisticas = ctk.CTkFrame(
     contenido_scroll,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20
 )
 
@@ -4912,7 +7233,7 @@ selector_metrica = ctk.CTkSegmentedButton(
     font=("Montserrat",14,"bold"),
     selected_color=AZUL,
     selected_hover_color=MORADO,
-    unselected_color="#2B2B2B",
+    unselected_color=GRIS2,
     command=cambiar_metrica_grafica
 )
 
@@ -4925,7 +7246,7 @@ selector_metrica.pack(
 grafica_canvas = ctk.CTkCanvas(
     estadisticas,
     height=240,
-    bg="#1A1A1A",
+    bg=NEGRO2,
     highlightthickness=0
 )
 
@@ -4960,7 +7281,7 @@ btn_detalle_estadisticas.pack(
 
 info = ctk.CTkFrame(
     contenido_scroll,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20
 )
 
@@ -5032,7 +7353,7 @@ notas_label.pack(
 
 comentarios = ctk.CTkFrame(
     contenido_scroll,
-    fg_color="#1A1A1A",
+    fg_color=NEGRO2,
     corner_radius=20
 )
 
@@ -5058,6 +7379,54 @@ caja_comentarios.pack(
     padx=20,
     pady=(0,20)
 )
+
+def eliminar_usuario():
+    """Elimina el usuario actualmente abierto, con confirmación."""
+    global usuario_actual
+
+    if usuario_actual is None:
+        return
+
+    nombre = usuario_actual
+
+    if nombre not in usuarios_db:
+        messagebox.showerror(
+            traducir("Eliminar usuario"),
+            traducir("No se encontró el usuario.")
+        )
+        return
+
+    if not messagebox.askyesno(
+        traducir("Eliminar usuario"),
+        f"{traducir('¿Seguro que quieres eliminar este usuario?')}\n\n👤 {nombre}"
+    ):
+        return
+
+    try:
+        usuarios_db.pop(nombre)
+        guardar_usuarios(usuarios_db)
+        registrar_evento(
+            "Alta de la persona",
+            f"Usuario eliminado: {nombre}",
+            usuario=nombre
+        )
+        usuario_actual = None
+        detener_camara()
+        perfil_frame.pack_forget()
+        sesion_frame.pack_forget()
+        inicio_frame.pack(fill="both", expand=True)
+        recargar_tarjetas_usuarios()
+        messagebox.showinfo(
+            traducir("Eliminar usuario"),
+            traducir("El usuario fue eliminado.")
+        )
+    except Exception as e:
+        print("Error eliminando usuario:", e)
+        messagebox.showerror(
+            traducir("Eliminar usuario"),
+            traducir("El usuario no pudo eliminarse.")
+        )
+
 
 def editar_usuario():
     """Edita nombre, edad y motivo del usuario abierto."""
@@ -5115,7 +7484,7 @@ botones.pack(
 
 ctk.CTkButton(
     botones,
-    text="▶ Iniciar sesión",
+    text=traducir("▶ Iniciar sesión"),
     width=220,
     fg_color=AZUL,
     hover_color=MORADO,
@@ -5124,18 +7493,29 @@ ctk.CTkButton(
 
 ctk.CTkButton(
     botones,
-    text="✏ Editar usuario",
+    text=traducir("✏ Editar usuario"),
     width=220,
     command=editar_usuario
 ).grid(row=0, column=1, padx=10)
 
 ctk.CTkButton(
     botones,
-    text="🗑 Eliminar usuario",
+    text=traducir("🗑 Eliminar usuario"),
     width=220,
-    fg_color="#B22222",
-    hover_color="#8B0000"
+    fg_color=ROJOOS,
+    hover_color="#8B0000",
+    command=eliminar_usuario
 ).grid(row=0, column=2, padx=10)
+
+ctk.CTkButton(
+    botones,
+    text=traducir("📄 Generar reporte PDF"),
+    width=220,
+    fg_color=VERDE,
+    text_color=NEGRO,
+    hover_color=MORADO,
+    command=exportar_graficas_para_imprimir
+).grid(row=0, column=3, padx=10)
 
 
 # ==========================================
